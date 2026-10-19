@@ -1,0 +1,49 @@
+{
+  "name": "agent-foundry",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "postinstall": "prisma generate",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p dashboard/tsconfig.json",
+    "build:dashboard": "npm run build && node scripts/build-dashboard.mjs",
+    "dashboard": "npm run build:dashboard --silent && node dist/src/dashboard.js",
+    "test": "npm run build && node --test dist/tests/**/*.test.js",
+    "agent": "npm run build --silent && node dist/src/cli.js",
+    "evals": "npm run build --silent && node dist/src/eval-cli.js list",
+    "eval": "npm run build --silent && node dist/src/eval-cli.js run",
+    "eval:compare": "npm run build --silent && node dist/src/eval-cli.js compare",
+    "runs": "npm run build --silent && node dist/src/run-cli.js list",
+    "run": "npm run build --silent && node dist/src/run-cli.js show",
+    "worker": "npm run build --silent && node dist/src/worker.js",
+    "recover": "npm run build --silent && node dist/src/recover.js",
+    "approvals": "npm run build --silent && node dist/src/approval-cli.js list",
+    "approve": "npm run build --silent && node dist/src/approval-cli.js approve",
+    "deny": "npm run build --silent && node dist/src/approval-cli.js deny",
+    "sandbox:build": "docker build -f sandbox/Dockerfile -t agent-foundry-sandbox:phase7 .",
+    "prisma:generate": "prisma generate",
+    "prisma:validate": "prisma validate",
+    "prisma:migrate": "prisma migrate deploy"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "esbuild": "^0.28.2",
+    "prisma": "^7.10.0",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "@prisma/adapter-pg": "^7.10.0",
+    "@prisma/client": "^7.10.0",
+    "bullmq": "^6.3.9",
+    "dotenv": "^18.0.4",
+    "ioredis": "^6.0.0",
+    "openai": "^7.25.0",
+    "pg": "^8.23.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  }
+}

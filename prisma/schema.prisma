@@ -1,0 +1,140 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum ExecutionStatus {
+  PENDING
+  RUNNING
+  WAITING_FOR_APPROVAL
+  COMPLETED
+  FAILED
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  DENIED
+}
+
+enum StepKind {
+  MODEL_CALL
+  TOOL_CALL
+  TOOL_RESULT
+  FINAL_ANSWER
+  POSTCONDITION_CHECK
+  RUNTIME_FAILURE
+  APPROVAL_REQUIRED
+  APPROVAL_APPROVED
+  APPROVAL_DENIED
+}
+
+model Agent {
+  id          String         @id @default(cuid())
+  name        String         @unique
+  description String?
+  versions    AgentVersion[]
+  tasks       Task[]
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+}
+
+model AgentVersion {
+  id                 String    @id @default(cuid())
+  agentId            String
+  agent              Agent     @relation(fields: [agentId], references: [id], onDelete: Restrict)
+  version            Int
+  systemInstructions String
+  modelProvider      String
+  modelName          String
+  maxSteps           Int
+  toolPolicies       Json
+  taskRuns           TaskRun[]
+  createdAt          DateTime  @default(now())
+
+  @@unique([agentId, version])
+}
+
+model Task {
+  id        String          @id @default(cuid())
+  agentId   String
+  agent     Agent           @relation(fields: [agentId], references: [id], onDelete: Restrict)
+  prompt    String
+  postconditions Json @default("[]")
+  workspaceRoot String
+  status    ExecutionStatus @default(PENDING)
+  runs      TaskRun[]
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+}
+
+model TaskRun {
+  id             String          @id @default(cuid())
+  taskId         String
+  task           Task            @relation(fields: [taskId], references: [id], onDelete: Restrict)
+  agentVersionId String
+  agentVersion   AgentVersion    @relation(fields: [agentVersionId], references: [id], onDelete: Restrict)
+  status         ExecutionStatus @default(PENDING)
+  finalAnswer    String?
+  failureReason  String?
+  failureMessage String?
+  workerId       String?
+  heartbeatAt    DateTime?
+  recoveryCount Int             @default(0)
+  steps          Step[]
+  approvals      Approval[]
+  evalRun        EvalRun?
+  createdAt      DateTime        @default(now())
+  startedAt      DateTime?
+  completedAt    DateTime?
+
+  @@index([status, heartbeatAt])
+}
+
+model Approval {
+  id                 String         @id @default(cuid())
+  taskRunId          String
+  taskRun            TaskRun        @relation(fields: [taskRunId], references: [id], onDelete: Cascade)
+  toolName            String
+  validatedArguments Json
+  resumeMessages     Json
+  runtimeStep         Int
+  status              ApprovalStatus @default(PENDING)
+  requestedAt         DateTime       @default(now())
+  decidedAt           DateTime?
+  consumedAt          DateTime?
+
+  @@index([status, requestedAt])
+  @@index([taskRunId, requestedAt])
+}
+
+model Step {
+  id        String   @id @default(cuid())
+  taskRunId String
+  taskRun   TaskRun  @relation(fields: [taskRunId], references: [id], onDelete: Cascade)
+  sequence  Int
+  kind      StepKind
+  payload   Json
+  createdAt DateTime @default(now())
+
+  @@unique([taskRunId, sequence])
+}
+
+model EvalRun {
+  id             String   @id @default(cuid())
+  caseId         String
+  caseRevision   String
+  caseDefinition Json
+  taskRunId      String   @unique
+  taskRun        TaskRun  @relation(fields: [taskRunId], references: [id], onDelete: Restrict)
+  result         Json?
+  createdAt      DateTime @default(now())
+  completedAt    DateTime?
+
+  @@index([caseId, createdAt])
+}

@@ -1,0 +1,26 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+src/generated/prisma/
+
+# Local exports, scratch files and agent smoke-test artifacts
+/output/
+/tmp/
+/coverage/
+*.tsbuildinfo
+/phase*-*.txt
+/postcondition-smoke-*.md
+/ARCHITECTURE_NOTE.md
+/FOUNDRY_DEMO.md
+
+# Local credentials and database dumps
+*.pem
+*.key
+*.p12
+*.pfx
+*.dump
+*.backup
