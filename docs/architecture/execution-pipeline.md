@@ -236,8 +236,14 @@ TaskRun success: the job may return a runtime `failed` or waiting status.
 for [`run-cli.ts`](../../src/run-cli.ts) and
 [`dashboard.ts`](../../src/dashboard.ts). The
 [`dashboard server`](../../src/dashboard/server.ts) exposes runs, details and
-approval decisions. Summaries omit large payloads, but raw Steps contain more
-data: not all R2 diagnostics are exposed as dedicated timeline fields. R3 outcomes
+approval decisions. Summaries omit large payloads. R2 context-budget failures expose
+available persisted numeric fields through optional `timeline.contextBudget`;
+oversized read results expose `TOOL_RESULT_TOO_LARGE` and optional byte counts
+through `timeline.toolResultLimit`, alongside the tool name. Missing/invalid
+metrics are omitted, not defaulted. These diagnostic projections never include
+raw prompts or tool content. Raw Steps still contain more data. The dashboard
+shows these diagnostics, provides exact-text Final Answer clipboard copying, and
+keeps desktop navigation visible with independently scrolling content. R3 outcomes
 are visible in postcondition messages. [`EvalRunner`](../../src/evals/runner.ts)
 submits ordinary runs and scores persisted outcomes; eval timeout does not cancel
 the underlying run.
@@ -252,13 +258,38 @@ runs are scanned, never approval waits or completed runs. Eligible runs incremen
 recoveryCount, retain history, return to PENDING and are enqueued for a fresh
 conversation. This is neither step-level resume nor R3 correction.
 
-Important implementation discrepancy: `isReadOnlyRepositoryRun` allows the named
-Repository Explorer with ALLOW reads **and a REQUIRE_APPROVAL create_file
-exception**. Delete-capable versions are rejected even if deletion was never
-used, so current default Explorer versions do not qualify. Do not infer broad
-write-retry safety from the function/error naming. Eligible recovery uses stale
-state checks; the unsafe `failStaleExecution` branch uses an unconditional run
-update, so concurrent recovery/heartbeat hardening is not complete.
+`isReadOnlyRepositoryRun` is capability-based and strictly read-only: only the
+named Repository Explorer with ALLOW for `list_files`, `search_files` and
+`read_file`, plus any DENY policies, qualifies. `create_file` and `delete_file`
+with ALLOW or REQUIRE_APPROVAL, and unknown executable capabilities, are
+ineligible even if never used. The former approval-gated creation exception is
+removed; current write-capable default Explorer versions do not qualify. A custom
+`canRecover` callback may veto recovery, never broaden this allowlist.
+
+For a stale, ineligible run, `failStaleExecution` rechecks RUNNING and heartbeat
+inside a transaction. Its conditional update also matches the observed worker
+ID, heartbeat and recovery count. If another worker/state transition or heartbeat
+wins, no failure or Step is written and the scanner reports `skipped`. The
+eligible requeue and recovery-limit paths use the same observed-lease fencing.
+On confirmed unsafe abandonment, Task and TaskRun become FAILED with
+`RECOVERY_NOT_SAFE`, ownership/heartbeat are cleared, and an ordered
+RUNTIME_FAILURE Step preserves the former worker ID and a diagnostic visible
+through existing run details. Previous Steps and approvals are retained, and
+recoveryCount is not incremented. No agent/tool execution is restarted.
+
+FAILED describes abandoned orchestration, not the outcome of prior side effects.
+It neither rolls back filesystem changes nor cancels an in-flight sandbox/model
+operation. In particular, a consumed approval without TOOL_RESULT remains
+ambiguous; it is not evidence that the action failed or permission to repeat it.
+Approval suspension/resume (section 5) is unchanged: WAITING_FOR_APPROVAL and
+PENDING runs are not stale-scan candidates, approved unconsumed actions resume
+normally, consumed approvals stay unavailable, and new sensitive calls still
+require their own approval. R3 correction is separate and unchanged.
+
+Database transitions and enqueue remain non-atomic. If recovery delivery throws,
+the error propagates to the recovery caller without overwriting PENDING or a
+newly claimed execution. If no job was delivered, a PENDING run may require manual
+delivery reconciliation; this phase does not add an outbox or delivery retry.
 
 The system has no exactly-once side-effect guarantee, generic write idempotency,
 step checkpoints, transactional enqueue, automatic provider fallback, model-call

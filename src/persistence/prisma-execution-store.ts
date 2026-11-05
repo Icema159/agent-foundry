@@ -407,6 +407,8 @@ export class PrismaExecutionStore implements ExecutionStore {
       const staleWhere = {
         id: run.id,
         status: "RUNNING" as const,
+        workerId: run.workerId,
+        heartbeatAt: run.heartbeatAt,
         recoveryCount: run.recoveryCount,
         OR: [{ heartbeatAt: null }, { heartbeatAt: { lt: staleBefore } }],
       };
@@ -418,6 +420,8 @@ export class PrismaExecutionStore implements ExecutionStore {
             failureReason: "RECOVERY_LIMIT_EXCEEDED",
             failureMessage: `Run exceeded ${maxRecoveries} whole-run recoveries`,
             completedAt: new Date(),
+            workerId: null,
+            heartbeatAt: null,
           },
         });
         if (failed.count !== 1) return { action: "SKIPPED" };
@@ -459,23 +463,40 @@ export class PrismaExecutionStore implements ExecutionStore {
     });
   }
 
-  async failStaleExecution(taskId: string, taskRunId: string, reason: string): Promise<void> {
-    await this.prisma.$transaction(async (transaction) => {
-      const run = await transaction.taskRun.update({
+  async failStaleExecution(taskId: string, taskRunId: string, staleBefore: Date, reason: string): Promise<boolean> {
+    return this.prisma.$transaction(async (transaction) => {
+      const run = await transaction.taskRun.findUnique({
         where: { id: taskRunId },
+        select: { taskId: true, status: true, workerId: true, heartbeatAt: true, recoveryCount: true },
+      });
+      if (!run || run.taskId !== taskId || run.status !== "RUNNING"
+        || (run.heartbeatAt && run.heartbeatAt >= staleBefore)) return false;
+      // CAS against the observed lease. A heartbeat, terminal transition, or
+      // ownership change between read and update invalidates this decision.
+      const failed = await transaction.taskRun.updateMany({
+        where: {
+          id: taskRunId, taskId, status: "RUNNING",
+          workerId: run.workerId, recoveryCount: run.recoveryCount,
+          heartbeatAt: run.heartbeatAt,
+          OR: [{ heartbeatAt: null }, { heartbeatAt: { lt: staleBefore } }],
+        },
         data: {
           status: "FAILED",
           failureReason: "RECOVERY_NOT_SAFE",
           failureMessage: reason,
           completedAt: new Date(),
+          workerId: null,
+          heartbeatAt: null,
         },
       });
+      if (failed.count !== 1) return false;
       const latest = await transaction.step.findFirst({ where: { taskRunId }, orderBy: { sequence: "desc" }, select: { sequence: true } });
       await transaction.step.create({ data: {
         taskRunId, sequence: (latest?.sequence ?? 0) + 1, kind: "RUNTIME_FAILURE",
         payload: { executionAttempt: run.recoveryCount + 1, runtimeStep: null, reason: "RECOVERY_NOT_SAFE", message: reason, workerId: run.workerId },
       } });
       await transaction.task.update({ where: { id: taskId }, data: { status: "FAILED" } });
+      return true;
     });
   }
 }

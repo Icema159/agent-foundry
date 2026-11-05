@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { RunDetails, RunSummary } from "../src/observability/run-query.js";
 import { Approvals, RunDetail, Runs, type Approval } from "./views.js";
@@ -12,6 +12,7 @@ async function api<T>(url: string, signal?: AbortSignal, method = "GET"): Promis
 }
 
 function App() {
+  const content = useRef<HTMLElement>(null);
   const [page, setPage] = useState("runs");
   const [selected, setSelected] = useState<string | null>(null);
   const [runs, setRuns] = useState<RunSummary[]>([]);
@@ -22,6 +23,7 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
+  useEffect(() => { content.current?.scrollTo({ top: 0 }); }, [page, selected]);
   useEffect(() => {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
@@ -51,7 +53,7 @@ function App() {
     finally { setBusy(null); }
   }
   return <div className="shell"><aside><div className="brand"><span className="brand-mark">F</span><div>Agent Foundry<small>Execution console</small></div></div><nav aria-label="Main navigation"><button className={page === "runs" ? "active" : ""} onClick={() => { setPage("runs"); setSelected(null); setNotice(""); }}>Runs</button><button className={page === "approvals" ? "active" : ""} onClick={() => { setPage("approvals"); setNotice(""); }}>Approvals</button></nav><p className="sidebar-note">Local workspace<br/>PostgreSQL execution history</p></aside>
-    <main><header><div><p className="eyebrow">AGENT FOUNDRY / OBSERVABILITY</p><h1>{page === "approvals" ? "Pending approvals" : selected ? "Run details" : "Recent runs"}</h1><p className="muted">{page === "approvals" ? "Review the exact action before allowing execution." : selected ? "Follow each step from task to final answer." : "Inspect execution status, model calls, and results."}</p></div><button className="secondary" onClick={() => setRevision(value => value + 1)}>Refresh</button></header>
+    <main ref={content} tabIndex={0} aria-label="Execution content"><header><div><p className="eyebrow">AGENT FOUNDRY / OBSERVABILITY</p><h1>{page === "approvals" ? "Pending approvals" : selected ? "Run details" : "Recent runs"}</h1><p className="muted">{page === "approvals" ? "Review the exact action before allowing execution." : selected ? "Follow each step from task to final answer." : "Inspect execution status, model calls, and results."}</p></div><button className="secondary" onClick={() => setRevision(value => value + 1)}>Refresh</button></header>
     {selected && page === "runs" && <button className="link back" onClick={() => setSelected(null)}>← All runs</button>}
     {error && <div role="alert" className="banner error">{error}</div>}{notice && <div role="status" className="banner">{notice}</div>}
     {loading ? <p className="panel empty">Loading execution history…</p> : page === "approvals" ? <Approvals approvals={approvals} busy={busy} decide={decide} open={open}/> : selected ? run && <RunDetail run={run}/> : <Runs runs={runs} open={open}/>}

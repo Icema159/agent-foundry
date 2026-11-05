@@ -130,5 +130,5 @@ export interface ExecutionStore {
     staleBefore: Date,
     maxRecoveries: number,
   ): Promise<RecoveryDecision>;
-  failStaleExecution(taskId: string, taskRunId: string, reason: string): Promise<void>;
+  failStaleExecution(taskId: string, taskRunId: string, staleBefore: Date, reason: string): Promise<boolean>;
 }

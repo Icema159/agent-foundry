@@ -125,3 +125,44 @@ test("failed runs show code, message and last useful events", async () => {
   assert.match(view, /Failure: SANDBOX_TIMEOUT — Sandbox exceeded 1000 ms/);
   assert.match(view, /RUNTIME_FAILURE.*code=SANDBOX_TIMEOUT/);
 });
+
+test("R2 read model exposes only persisted numeric context diagnostics and safe tool limit metadata", async () => {
+  const details = await query([record({ steps: [
+    { sequence: 1, kind: "TOOL_RESULT", createdAt: at(100), payload: {
+      name: "read_file", result: { content: "PRIVATE_TOOL_CONTENT" },
+      outputLimit: { code: "TOOL_RESULT_TOO_LARGE", resultBytes: 19001, limitBytes: 8000, secret: "PRIVATE_DIAGNOSTIC" },
+    } },
+    { sequence: 2, kind: "RUNTIME_FAILURE", createdAt: at(200), payload: {
+      reason: "CONTEXT_BUDGET_EXCEEDED", message: "Estimated request exceeds budget", details: {
+        contextWindowTokens: 16384, estimatedInputTokens: 14001, inputBudgetTokens: 13312,
+        reservedOutputTokens: 2048, safetyMarginTokens: 1024, messages: "PRIVATE_PROMPT",
+      },
+    } },
+  ] })]).get("run-1");
+  assert.deepEqual(details!.timeline[0]!.toolResultLimit, { code: "TOOL_RESULT_TOO_LARGE", resultBytes: 19001, limitBytes: 8000 });
+  assert.equal(details!.timeline[0]!.failureCode, "TOOL_RESULT_TOO_LARGE");
+  assert.equal(details!.timeline[0]!.toolName, "read_file");
+  assert.deepEqual(details!.timeline[1]!.contextBudget, {
+    contextWindowTokens: 16384, estimatedInputTokens: 14001, inputBudgetTokens: 13312,
+    reservedOutputTokens: 2048, safetyMarginTokens: 1024,
+  });
+  assert.doesNotMatch(JSON.stringify(details), /PRIVATE_/);
+});
+
+test("R2 diagnostics omit missing or invalid metrics without defaults and preserve unrelated events", async () => {
+  const details = await query([record({ steps: [
+    { sequence: 1, kind: "RUNTIME_FAILURE", createdAt: at(100), payload: {
+      reason: "CONTEXT_BUDGET_EXCEEDED", details: { inputBudgetTokens: 0, estimatedInputTokens: "200", contextWindowTokens: -1, safetyMarginTokens: 1.5, reservedOutputTokens: Number.MAX_SAFE_INTEGER + 1 },
+    } },
+    { sequence: 2, kind: "TOOL_RESULT", createdAt: at(200), payload: { name: "read_file", result: {}, outputLimit: { code: "TOOL_RESULT_TOO_LARGE", limitBytes: "8000", resultBytes: -10 } } },
+    { sequence: 3, kind: "TOOL_RESULT", createdAt: at(300), payload: { name: "read_file", result: { count: 1 } } },
+    { sequence: 4, kind: "RUNTIME_FAILURE", createdAt: at(400), payload: { reason: "CONTEXT_BUDGET_EXCEEDED" } },
+    { sequence: 5, kind: "RUNTIME_FAILURE", createdAt: at(500), payload: { reason: "SANDBOX_TIMEOUT", details: { inputBudgetTokens: 10 } } },
+  ] })]).get("run-1");
+  assert.deepEqual(details!.timeline[0]!.contextBudget, { inputBudgetTokens: 0 });
+  assert.deepEqual(details!.timeline[1]!.toolResultLimit, { code: "TOOL_RESULT_TOO_LARGE" });
+  assert.equal(details!.timeline[2]!.toolResultLimit, undefined);
+  assert.equal(details!.timeline[2]!.failureCode, undefined);
+  assert.equal(details!.timeline[3]!.contextBudget, undefined);
+  assert.equal(details!.timeline[4]!.contextBudget, undefined);
+});

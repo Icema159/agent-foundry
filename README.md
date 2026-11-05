@@ -181,7 +181,7 @@ npm run eval -- locate-model-provider-factory
 npm run eval:compare -- locate-model-provider-factory
 ```
 
-Recovery is an **explicit stale-run scan**, not a worker-started periodic service. It restarts eligible whole runs, not individual steps. Delete-capable versions, including current defaults, are ineligible. The existing eligibility rule has an approval-gated create_file exception; do not infer general write-retry safety from its read-only naming.
+Recovery is an **explicit stale-run scan**, not a worker-started periodic service. It restarts only strictly read-only Repository Explorer runs, not individual steps. Create/delete-capable versions, including current defaults, are ineligible even when writes require approval. Confirmed stale, non-recoverable runs are marked FAILED with `RECOVERY_NOT_SAFE` without restarting execution or asserting a side-effect outcome. See [recovery policy and crash-window limitations](docs/architecture/execution-pipeline.md#10-whole-run-recovery-and-current-limitations).
 
 Evals submit normal TaskRuns and score persisted behavior. They are deterministic assertion-based smoke cases, not LLM judges or contamination-resistant benchmarks. Model comparisons require equivalent persisted agent configurations. Eval timeout does not cancel the underlying run.
 

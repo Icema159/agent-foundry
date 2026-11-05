@@ -302,12 +302,18 @@ class MemoryExecutionStore implements ExecutionStore {
     return { action: "REQUEUE", recoveryCount: run.recoveryCount };
   }
 
-  async failStaleExecution(taskId: string, taskRunId: string, reason: string) {
+  async failStaleExecution(taskId: string, taskRunId: string, staleBefore: Date, reason: string) {
     const run = this.requireRun(taskRunId);
+    if (run.taskId !== taskId || run.status !== "RUNNING" || (run.heartbeatAt && run.heartbeatAt >= staleBefore)) return false;
     run.status = "FAILED";
-    run.failureReason = reason;
+    run.failureReason = "RECOVERY_NOT_SAFE";
+    run.steps.push({ sequence: run.steps.length + 1, kind: "RUNTIME_FAILURE",
+      payload: { executionAttempt: run.recoveryCount + 1, reason: "RECOVERY_NOT_SAFE", message: reason, workerId: run.workerId } });
+    run.workerId = null;
+    run.heartbeatAt = null;
     const task = this.tasks.get(taskId);
     if (task) task.status = "FAILED";
+    return true;
   }
 
   private requireRun(id: string): StoredRun {
@@ -1097,6 +1103,23 @@ test("waiting runs are not stale and an old worker cannot claim an approved acti
     () => store.claimApprovalAction(pending.taskRunId, "old-worker", approval.id, new Date()),
     /Lease lost/,
   );
+  assert.equal(executions.count, 0);
+});
+
+test("a consumed approval cannot be claimed again by the same or a later worker", async () => {
+  const store = new MemoryExecutionStore();
+  const executions = { count: 0 };
+  const { pending, approval } = await runUntilApproval(store, executions);
+  await store.decideApproval(approval.id, "APPROVED");
+  await store.claimExecution(pending.taskId, pending.taskRunId, "worker-1", new Date());
+  await store.claimApprovalAction(pending.taskRunId, "worker-1", approval.id, new Date());
+  const consumedAt = store.approvals.get(approval.id)!.consumedAt;
+  assert.ok(consumedAt);
+  await assert.rejects(() => store.claimApprovalAction(pending.taskRunId, "worker-1", approval.id, new Date()), /unavailable/);
+  // Simulate a later valid owner: persistent consumption still blocks reuse.
+  store.runs.get(pending.taskRunId)!.workerId = "worker-2";
+  await assert.rejects(() => store.claimApprovalAction(pending.taskRunId, "worker-2", approval.id, new Date()), /unavailable/);
+  assert.equal(store.approvals.get(approval.id)!.consumedAt, consumedAt);
   assert.equal(executions.count, 0);
 });
 

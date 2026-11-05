@@ -1,6 +1,7 @@
 import type { PersistedStepKind } from "../persistence/execution-store.js";
 import type { ModelUsage } from "../model/types.js";
 import type { TaskPostcondition } from "../verification/task-postconditions.js";
+import type { ContextBudgetDiagnostic } from "../runtime/context-budget-guard.js";
 
 export type RunRecord = {
   id: string;
@@ -72,6 +73,8 @@ export type TimelineEntry = {
   model?: string;
   usage?: ModelUsage;
   verificationPassed?: boolean;
+  contextBudget?: Partial<ContextBudgetDiagnostic>;
+  toolResultLimit?: { code: "TOOL_RESULT_TOO_LARGE"; resultBytes?: number; limitBytes?: number };
 };
 
 export type RunDetails = RunSummary & {
@@ -135,6 +138,11 @@ export class RunQueryService {
         if (step.kind === "TOOL_RESULT") {
           entry.toolName = string(payload.name);
           entry.resultSummary = summary(payload.result, "result");
+          const limit = object(payload.outputLimit);
+          if (limit.code === "TOOL_RESULT_TOO_LARGE") {
+            entry.failureCode = limit.code;
+            entry.toolResultLimit = { code: limit.code, ...numericFields(limit, ["resultBytes", "limitBytes"]) };
+          }
         }
         if (step.kind.startsWith("APPROVAL_")) {
           entry.toolName = string(payload.toolName);
@@ -147,6 +155,13 @@ export class RunQueryService {
           entry.failureCode = string(payload.reason);
           entry.message = string(payload.message);
           entry.workerId = string(payload.workerId);
+          if (payload.reason === "CONTEXT_BUDGET_EXCEEDED") {
+            const diagnostic = numericFields(object(payload.details), [
+              "contextWindowTokens", "estimatedInputTokens", "inputBudgetTokens",
+              "reservedOutputTokens", "safetyMarginTokens",
+            ]);
+            if (Object.keys(diagnostic).length) entry.contextBudget = diagnostic;
+          }
         }
         if (step.kind === "FINAL_ANSWER") entry.answer = string(payload.answer);
         if (step.kind === "POSTCONDITION_CHECK") {
@@ -212,6 +227,15 @@ function string(value: unknown): string | undefined {
 
 function positiveInteger(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function numericFields<K extends string>(raw: Record<string, unknown>, keys: readonly K[]): Partial<Record<K, number>> {
+  const result: Partial<Record<K, number>> = {};
+  for (const key of keys) {
+    const value = raw[key];
+    if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) result[key] = value;
+  }
+  return result;
 }
 
 function isDuration(value: unknown): value is number {
