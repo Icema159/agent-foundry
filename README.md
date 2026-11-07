@@ -90,6 +90,24 @@ FOUNDRY_DASHBOARD_PORT=3001 npm run dashboard
 
 Open [http://127.0.0.1:3001](http://127.0.0.1:3001). The default port without an override is 3000. The dashboard and worker are separate processes; opening the UI does not start execution.
 
+Optional external-agent control-plane API (separate from the dashboard):
+
+```bash
+npm run external-api
+```
+
+It listens on `127.0.0.1:3002` by default; set `FOUNDRY_EXTERNAL_API_PORT` to
+change the port. The API requires a scoped agent Bearer credential created through
+the trusted in-process administration boundary. Network exposure requires a trusted
+TLS terminator and protected routing; do not expose the local dashboard. See the
+[external API contract and limits](docs/architecture/execution-pipeline.md#11-current-integration-versus-future-contract).
+
+Phase 11.2a adds a deliberately narrow operator-approved resource-free READ_ONLY
+binding. Eligible Invocations can be READY, but `executionAllowed` remains false:
+there is still no remote executor or start/approval endpoint. Binding configuration
+is trusted local administration, not agent input. Apply the new migration before
+starting upgraded API code; see [authorization scope and limitations](docs/architecture/external-authorization.md).
+
 Terminal 3 — submit a read-only task:
 
 ```bash
@@ -209,6 +227,10 @@ Automated tests use fake model providers and do not require real Ollama/OpenAI A
 
 ## Direction
 
-**PROPOSED / NOT IMPLEMENTED:** Agent Contract, Bring Your Own Agent, and Bring Your Own Tools. The current CLI/worker remain coupled to Repository Explorer. No multi-agent orchestration or general external-agent registration is implemented.
+External-agent identity, registration, immutable configuration, grants and a blocked
+Invocation control-plane API are implemented. **PROPOSED / NOT IMPLEMENTED:**
+remote tool execution and complete Bring Your Own Agent / Bring Your Own Tools.
+The current CLI/worker remain coupled to Repository Explorer; no multi-agent
+orchestration or external-agent hosting is implemented.
 
 The project is intended as a transparent, inspectable engineering harness: its guarantees, tests, and limitations matter more than a broad feature count.

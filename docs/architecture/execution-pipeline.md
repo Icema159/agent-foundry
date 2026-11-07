@@ -304,8 +304,140 @@ chooses reasoning/tool requests; Foundry owns delivery, state, managed execution
 authorization, isolation, verification and observability. Provider-agnostic model
 calls do not make the whole platform agent-agnostic.
 
-Agent Contract / BYOA / bring-your-own-tools is **PROPOSED / NOT IMPLEMENTED**.
-Its public interfaces and guarantees are not defined by this document. Create
-`docs/design/agent-contract.md` only when that design is explicitly undertaken.
+Phases 11.1a–11.1d add local identity/registry, external-run and authenticated HTTP
+control-plane foundations; external tool execution and general BYOA remain **NOT IMPLEMENTED**.
+[`agent-contract.md`](../design/agent-contract.md) documents the proposed design.
+
+[`identity.ts`](../../src/identity/identity.ts) defines operator, agent and executor
+principals, scoped opaque random credentials (SHA-256 verifier only), expiry and
+revocation. Trusted in-process administration/issuance is a bootstrap boundary,
+not a public or authenticated API. No credentials or operators are auto-created.
+`CredentialAuthenticator` derives immutable contexts from stored credentials;
+registry operations call `authorize` to recheck current credential state, scopes
+and principal binding. `requireScope` / `requireOwner` alone check only the
+snapshot. Revocation is not transactionally serialized with an already in-flight
+registry operation. Never trust context fields from a client request.
+
+[`AgentRegistry`](../../src/identity/agent-registry.ts) derives owner from context,
+permits operators to register EXTERNAL identities and restricts agent reads to its
+bound external agent. Executors have no registry permission. The initial migration
+assigns all pre-existing agents to `foundry-local-owner` as REFERENCE without
+changing IDs or run relationships. Names remain globally unique for compatibility:
+the same name cannot be registered by another owner, but lookup is owner-scoped.
+`repository-explorer` is reserved for the existing local harness. Reference CLI
+resolution is constrained to the local owner and REFERENCE type.
+
+Executor `deploymentId` is currently an opaque trusted-administrator-supplied
+binding, not evidence that a deployment exists, belongs to an owner, or is isolated.
+External runs are stored separately from reference TaskRun records. Reference
+load/claim/heartbeat additionally reject `ext_` IDs; stale recovery queries only
+reference TaskRun records. No external worker heartbeat is required.
+Existing dashboard endpoints remain local-only and unauthenticated.
+
+Phase 11.1b adds [`ExternalRegistry`](../../src/registry/external-registry.ts),
+separate external versions, manifests/tool revisions, inert deployment metadata and
+operator-managed grants. External versions do not require reference model fields.
+Publishing the same identity/content is idempotent; conflicting content is rejected.
+Canonical fingerprints use sorted JSON object keys, preserve array order and use
+SHA-256. Version config is limited to 64 KiB and JSON nesting depth 8. Tool revisions
+are scoped to their immutable manifest, and grants bind the exact tool record ID.
+Manifest publication and sealing occur transactionally; database triggers reject
+updates/deletes and prevent inserting tools after sealing. Privileged DB clients are
+trusted and could directly insert a malformed sealed manifest; use the service.
+
+[`validation.ts`](../../src/registry/validation.ts) accepts 1–32 unique named tools,
+positive revisions and the four declared effect categories. Its bounded input-schema
+subset permits `type`, `description`, object `properties`, `required`,
+`additionalProperties: false`, and array `items`; unsupported keywords are rejected.
+The schema root must be an object, schema nesting is limited to 6 and each object to
+64 properties. This validates the declaration, not future invocation arguments.
+The agent-provided profile is untrusted: a separately scoped operator supplies the
+reviewed profile and explicit non-wildcard resource IDs. A declared write cannot be
+downgraded to READ_ONLY. Only one active grant per owner/version/tool/deployment is
+permitted; revocation does not change published version/manifest records. New operator
+scopes are `version:publish`, `manifest:publish`, `deployment:manage`, `grant:manage`
+and `capability:check`; bound agent credentials may have the two publish scopes and
+`capability:check`. Existing credentials do not acquire new scopes automatically.
+
+`decide` returns DENY, ALLOW or REQUIRE_APPROVAL **with executionAllowed=false in all
+cases**. It is preliminary authorization data: the requested resource is caller
+provided and has not been derived from validated arguments. Future InvocationService
+must validate arguments, independently bind resources, enforce current authorization
+and approval, and serialize revocation against start before any dispatch. Grant and
+credential revocation are not serialized against an in-flight 11.1b service operation.
+Deployment metadata does not establish executor existence, artifact provenance or
+isolation. No public API, external approvals, reference TaskRuns or tool dispatch were added.
+
+Phase 11.1c adds [`InvocationService`](../../src/invocation/invocation-service.ts),
+`ExternalRun`, `Invocation` and append-only `InvocationEvent`. External runs are
+bound to an authenticated AGENT, owner and external version, without reference
+model/workspace fields. Credentials require explicit `run:manage` or
+`invocation:request` scopes; existing credentials do not inherit new scopes.
+
+Admission validates bounded JSON arguments against the published schema subset and
+rejects obvious credential fields/tokens. This is not a general secret detector;
+arguments can contain other sensitive data and are stored in the Invocation. Events
+contain status/reason and principal ID, not argument payloads. The idempotency key is
+unique per owner/run and fingerprinted with tool, deployment, requested grant and
+canonical arguments; the run pins agent/version. A same-key replay returns its
+original receipt before closure/grant/single-active checks, after fresh identity
+verification; changed payload conflicts. PostgreSQL run row locks serialize
+admission, cancellation and closure. A partial unique index enforces one active
+invocation across REQUESTED, READY, PENDING_APPROVAL, CLAIMED, START_AUTHORIZED,
+RUNNING and UNKNOWN. Events and state commit together; a DB sequence orders events
+within a locked run, with gaps possible.
+
+No matching active grant yields a durable DENIED receipt. A candidate grant yields
+REQUESTED with `RESOURCE_BINDING_UNVERIFIED`, never READY: no caller-provided resource
+establishes execution permission. An agent may cancel only this blocked REQUESTED
+state to REVOKED and close a run only with no active/UNKNOWN invocation. No service
+transitions to approval, claim, start, success, failure or UNKNOWN are enabled; the
+enum reserves future states. UNKNOWN stays active and cannot be cancelled or retried.
+Run COMPLETED means only that the developer closed orchestration with no unresolved
+invocation; it does not assert that denied actions or the task itself succeeded.
+No queue or executor is added. Credential/grant revocation is not
+serialized with an in-flight admission. A future start boundary must transactionally
+reauthorize and independently bind validated arguments to protected resources.
+
+Phase 11.1d adds [`external-api/server.ts`](../../src/external-api/server.ts), a
+separate versioned HTTP adapter around InvocationService. The entry point
+[`external-api.ts`](../../src/external-api.ts) listens only on `127.0.0.1` (default
+port 3002); network exposure requires TLS termination and protected proxy routing.
+Never expose the unrelated unauthenticated dashboard as the external API.
+
+Each request authenticates a Bearer credential anew, requires an AGENT principal
+and appropriate `run:manage` or `invocation:request` scope; services recheck
+current credentials and scope resources by owner plus bound agent. Malformed,
+expired and revoked credentials get 401, wrong role/scope 403, inaccessible or
+missing resources 404, validation errors 400, lifecycle conflicts 409, oversized
+bodies 413 and unsupported content types 415. Responses use `{ error: { code,
+message } }` and never expose database errors or stack traces. Submission returns
+the same safe receipt for new requests and idempotent replays. Public DTOs omit raw
+arguments, fingerprints, credential material, owner and principal IDs. Existing
+stored Invocation arguments may still contain sensitive data: there is no complete
+redaction/retention system. Authorized callers need their own submitted arguments
+for retries; there is no raw argument retrieval endpoint.
+
+Routes are `POST /api/v1/external/runs`, `GET /api/v1/external/runs/:id`,
+`POST /api/v1/external/runs/:id/invocations`,
+`GET /api/v1/external/invocations/:id`,
+`POST /api/v1/external/invocations/:id/cancel`,
+`GET /api/v1/external/runs/:id/history`, and
+`POST /api/v1/external/runs/:id/close`. POST requests require JSON; cancel and close
+accept `{}`. Request bodies are limited to 64 KiB, responses to 128 KiB and history
+pages to 100 events. The decimal `after` cursor must belong to the same authorized
+run; `nextCursor` is the last returned sequence and may be reused to poll for later
+events even when `hasMore` is false. Gaps in global sequence numbers are normal.
+Event status reflects the recorded transition; use GET invocation for current state.
+History is reconciliation data, not an agent reasoning checkpoint. There is no
+API for approvals, execution, credential issuance or grants.
+
+Phase 11.2a adds operator-attested resource-free READ_ONLY eligibility and immutable
+Invocation authorization evidence. Supported requests may reach READY or blocked
+PENDING_APPROVAL; unverifiable resources retain RESOURCE_BINDING_UNVERIFIED. No
+external execution or start endpoint is enabled, and public receipts still report
+`executionAllowed: false`. See [external authorization](external-authorization.md)
+for the exact supported schema, policy/revocation locks, start-time guard and limits.
+
 Dedicated subsystem architecture documents should be extracted from this map
 only when justified, with links instead of duplicated explanations.

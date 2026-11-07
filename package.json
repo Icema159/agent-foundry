@@ -9,6 +9,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p dashboard/tsconfig.json",
     "build:dashboard": "npm run build && node scripts/build-dashboard.mjs",
     "dashboard": "npm run build:dashboard --silent && node dist/src/dashboard.js",
+    "external-api": "npm run build --silent && node dist/src/external-api.js",
     "test": "npm run build && node --test dist/tests/**/*.test.js",
     "agent": "npm run build --silent && node dist/src/cli.js",
     "evals": "npm run build --silent && node dist/src/eval-cli.js list",

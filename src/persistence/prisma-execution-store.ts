@@ -26,9 +26,9 @@ export class PrismaExecutionStore implements ExecutionStore {
 
   async resolveAgentVersion(definition: AgentDefinition): Promise<ResolvedAgentVersion> {
     const agent = await this.prisma.agent.upsert({
-      where: { name: definition.name },
+      where: { name: definition.name, ownerId: "foundry-local-owner", integration: "REFERENCE" },
       update: { description: definition.description },
-      create: { name: definition.name, description: definition.description },
+      create: { name: definition.name, description: definition.description, ownerId: "foundry-local-owner", integration: "REFERENCE" },
     });
     const version = await this.prisma.agentVersion.upsert({
       where: { agentId_version: { agentId: agent.id, version: definition.version } },
@@ -72,6 +72,7 @@ export class PrismaExecutionStore implements ExecutionStore {
   }
 
   async loadExecution(taskRunId: string): Promise<LoadedExecution> {
+    if (taskRunId.startsWith("ext_")) throw new Error("External runs cannot enter reference execution");
     const run = await this.prisma.taskRun.findUnique({
       where: { id: taskRunId },
       include: {
@@ -142,6 +143,7 @@ export class PrismaExecutionStore implements ExecutionStore {
     workerId: string,
     now: Date,
   ): Promise<void> {
+    if (taskRunId.startsWith("ext_")) throw new Error("External runs cannot enter reference execution");
     await this.prisma.$transaction(async (transaction) => {
       const updated = await transaction.taskRun.updateMany({
         where: { id: taskRunId, taskId, status: "PENDING" },
@@ -158,6 +160,7 @@ export class PrismaExecutionStore implements ExecutionStore {
   }
 
   async heartbeat(taskRunId: string, workerId: string, now: Date): Promise<void> {
+    if (taskRunId.startsWith("ext_")) throw new Error("External runs cannot enter reference execution");
     const updated = await this.prisma.taskRun.updateMany({
       where: { id: taskRunId, status: "RUNNING", workerId },
       data: { heartbeatAt: now },

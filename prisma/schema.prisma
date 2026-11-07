@@ -34,14 +34,296 @@ enum StepKind {
   APPROVAL_DENIED
 }
 
+enum AgentIntegration {
+  REFERENCE
+  EXTERNAL
+}
+
+enum PrincipalType {
+  OPERATOR
+  AGENT
+  EXECUTOR
+}
+
+model Owner {
+  id         String      @id @default(cuid())
+  name       String
+  agents     Agent[]
+  principals Principal[]
+  externalVersions ExternalAgentVersion[]
+  manifests ToolManifest[]
+  tools ToolRevision[]
+  deployments ExecutorDeployment[]
+  grants CapabilityGrant[]
+  resourceBindings TrustedResourceBinding[]
+  createdAt  DateTime    @default(now())
+}
+
+model Principal {
+  id           String        @id @default(cuid())
+  ownerId      String
+  owner        Owner         @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  type         PrincipalType
+  agentId      String?
+  agent        Agent?        @relation(fields: [ownerId, agentId], references: [ownerId, id], onDelete: Restrict)
+  deploymentId String?
+  credentials  Credential[]
+  issuedGrants CapabilityGrant[]
+  approvedBindings TrustedResourceBinding[]
+  createdAt    DateTime      @default(now())
+
+  @@index([ownerId])
+  @@unique([ownerId, id])
+}
+
+model Credential {
+  id         String    @id @default(cuid())
+  principalId String
+  principal  Principal @relation(fields: [principalId], references: [id], onDelete: Restrict)
+  verifier   String    @unique
+  scopes     String[]
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  invocationAuthorizations InvocationAuthorization[]
+
+  @@index([principalId])
+}
+
 model Agent {
   id          String         @id @default(cuid())
   name        String         @unique
+  ownerId     String         @default("foundry-local-owner")
+  owner       Owner          @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  integration AgentIntegration @default(REFERENCE)
   description String?
+  principals  Principal[]
+  externalVersions ExternalAgentVersion[]
   versions    AgentVersion[]
   tasks       Task[]
   createdAt   DateTime       @default(now())
   updatedAt   DateTime       @updatedAt
+
+  @@unique([ownerId, id])
+}
+
+model ExternalAgentVersion {
+  id String @id @default(cuid())
+  ownerId String
+  owner Owner @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  agentId String
+  agent Agent @relation(fields: [ownerId, agentId], references: [ownerId, id], onDelete: Restrict)
+  version Int
+  config Json
+  digest String
+  createdAt DateTime @default(now())
+  manifests ToolManifest[]
+  grants CapabilityGrant[]
+  runs ExternalRun[]
+
+  @@unique([agentId, version])
+  @@unique([ownerId, id])
+  @@unique([ownerId, agentId, id])
+}
+
+model ToolManifest {
+  id String @id @default(cuid())
+  ownerId String
+  owner Owner @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  versionId String
+  version ExternalAgentVersion @relation(fields: [ownerId, versionId], references: [ownerId, id], onDelete: Restrict)
+  revision Int
+  digest String
+  sealed Boolean @default(false)
+  createdAt DateTime @default(now())
+  tools ToolRevision[]
+
+  @@unique([versionId, revision])
+  @@unique([ownerId, versionId, id])
+}
+
+model ToolRevision {
+  id String @id @default(cuid())
+  ownerId String
+  owner Owner @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  versionId String
+  manifestId String
+  manifest ToolManifest @relation(fields: [ownerId, versionId, manifestId], references: [ownerId, versionId, id], onDelete: Restrict)
+  name String
+  revision Int
+  description String
+  inputSchema Json
+  declaredProfile EffectProfile
+  handlerId String
+  digest String
+  grants CapabilityGrant[]
+  invocations Invocation[]
+
+  resourceBindings TrustedResourceBinding[]
+
+  @@unique([manifestId, name])
+  @@unique([ownerId, versionId, id])
+}
+
+enum EffectProfile {
+  READ_ONLY
+  WRITE
+  DESTRUCTIVE
+  EXTERNAL_WRITE
+}
+
+model ExecutorDeployment {
+  id String @id @default(cuid())
+  ownerId String
+  owner Owner @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  name String
+  environment String
+  createdAt DateTime @default(now())
+  grants CapabilityGrant[]
+  invocations Invocation[]
+  resourceBindings TrustedResourceBinding[]
+
+  @@unique([ownerId, name, environment])
+  @@unique([ownerId, id])
+}
+
+model CapabilityGrant {
+  id String @id @default(cuid())
+  ownerId String
+  owner Owner @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  versionId String
+  version ExternalAgentVersion @relation(fields: [ownerId, versionId], references: [ownerId, id], onDelete: Restrict)
+  toolId String
+  tool ToolRevision @relation(fields: [ownerId, versionId, toolId], references: [ownerId, versionId, id], onDelete: Restrict)
+  deploymentId String
+  deployment ExecutorDeployment @relation(fields: [ownerId, deploymentId], references: [ownerId, id], onDelete: Restrict)
+  reviewedProfile EffectProfile
+  allowedResources String[]
+  issuedByPrincipalId String
+  issuedBy Principal @relation(fields: [ownerId, issuedByPrincipalId], references: [ownerId, id], onDelete: Restrict)
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+  invocations Invocation[]
+
+  @@index([ownerId, versionId, toolId, deploymentId, revokedAt])
+  @@unique([ownerId, versionId, toolId, deploymentId, id])
+}
+
+model TrustedResourceBinding {
+  id String @id @default(cuid())
+  ownerId String
+  owner Owner @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  versionId String
+  toolId String
+  tool ToolRevision @relation(fields: [ownerId, versionId, toolId], references: [ownerId, versionId, id], onDelete: Restrict)
+  deploymentId String
+  deployment ExecutorDeployment @relation(fields: [ownerId, deploymentId], references: [ownerId, id], onDelete: Restrict)
+  revision Int
+  mode String
+  artifactDigest String
+  toolDigest String
+  deploymentDigest String
+  approvedByPrincipalId String
+  approvedBy Principal @relation(fields: [ownerId, approvedByPrincipalId], references: [ownerId, id], onDelete: Restrict)
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+  authorizations InvocationAuthorization[]
+
+  @@unique([toolId, deploymentId, revision])
+  @@index([ownerId, versionId, toolId, deploymentId, revokedAt])
+}
+
+model InvocationAuthorization {
+  invocationId String @id
+  runId String
+  invocation Invocation @relation(fields: [runId, invocationId], references: [runId, id], onDelete: Restrict)
+  bindingId String
+  binding TrustedResourceBinding @relation(fields: [bindingId], references: [id], onDelete: Restrict)
+  credentialId String
+  credential Credential @relation(fields: [credentialId], references: [id], onDelete: Restrict)
+  snapshot Json
+  digest String
+  createdAt DateTime @default(now())
+
+  @@unique([runId, invocationId])
+}
+
+enum ExternalRunStatus {
+  RUNNING
+  COMPLETED
+}
+
+enum InvocationStatus {
+  REQUESTED
+  READY
+  PENDING_APPROVAL
+  CLAIMED
+  START_AUTHORIZED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  DENIED
+  REVOKED
+  EXPIRED
+  UNKNOWN
+}
+
+model ExternalRun {
+  id String @id
+  ownerId String
+  agentId String
+  versionId String
+  version ExternalAgentVersion @relation(fields: [ownerId, agentId, versionId], references: [ownerId, agentId, id], onDelete: Restrict)
+  status ExternalRunStatus @default(RUNNING)
+  createdAt DateTime @default(now())
+  completedAt DateTime?
+  invocations Invocation[]
+
+  @@unique([ownerId, agentId, versionId, id])
+}
+
+model Invocation {
+  id String @id @default(cuid())
+  ownerId String
+  agentId String
+  versionId String
+  runId String
+  run ExternalRun @relation(fields: [ownerId, agentId, versionId, runId], references: [ownerId, agentId, versionId, id], onDelete: Restrict)
+  toolId String
+  tool ToolRevision @relation(fields: [ownerId, versionId, toolId], references: [ownerId, versionId, id], onDelete: Restrict)
+  deploymentId String
+  deployment ExecutorDeployment @relation(fields: [ownerId, deploymentId], references: [ownerId, id], onDelete: Restrict)
+  grantId String?
+  grant CapabilityGrant? @relation(fields: [ownerId, versionId, toolId, deploymentId, grantId], references: [ownerId, versionId, toolId, deploymentId, id], onDelete: Restrict)
+  idempotencyKey String
+  arguments Json
+  fingerprint String
+  status InvocationStatus
+  reason String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  events InvocationEvent[]
+  authorization InvocationAuthorization?
+
+  @@unique([ownerId, runId, idempotencyKey])
+  @@unique([runId, id])
+}
+
+model InvocationEvent {
+  sequence BigInt @id @default(autoincrement())
+  runId String
+  invocationId String
+  invocation Invocation @relation(fields: [runId, invocationId], references: [runId, id], onDelete: Restrict)
+  actorPrincipalId String
+  kind String
+  status InvocationStatus
+  reason String
+  authorization Json?
+  createdAt DateTime @default(now())
+
+  @@index([runId, sequence])
 }
 
 model AgentVersion {

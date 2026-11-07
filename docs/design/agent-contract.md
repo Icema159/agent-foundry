@@ -7,6 +7,17 @@ storage changes below are implementation targets, not currently available featur
 The [current execution pipeline](../architecture/execution-pipeline.md) remains
 authoritative for implemented Repository Explorer behavior.
 
+Phases 11.1a–11.1d implement identity, registry, external-run, blocked Invocation
+admission and an authenticated loopback HTTP API, documented in the current pipeline.
+Remote execution and approval below remain proposed. Deployment metadata does not
+provision an executor or verify isolation. Capability decisions are preliminary and
+cannot authorize execution until actual arguments/resources are independently bound.
+
+Phase 11.2a implements only the narrow operator-attested resource-free eligibility
+and reauthorization foundation described in [external authorization](../architecture/external-authorization.md).
+READY can now represent that supported case; every actual executor claim/start,
+approval decision and execution protocol below remains **PROPOSED / NOT IMPLEMENTED**.
+
 **Developer owns intelligence. Foundry owns execution.** Here, execution means
 capabilities delegated through Foundry's enforced boundary, not everything an agent
 can do on its host. Bring your own agent and tools without adopting Foundry's model
@@ -83,7 +94,7 @@ references, never authorization. The server derives caller identity from credent
 | Concept | Proposed durable meaning |
 | --- | --- |
 | Principal / Credential | Separate operator, agent and executor subjects; credential hash, scopes, expiry/revocation and subject binding. Never store plaintext bearer secrets in history. |
-| Agent / AgentVersion | Stable owner-scoped identity; immutable external integration configuration and exact manifest bindings. A changed version number with conflicting content is rejected. External versions need no provider, model, system prompt or Foundry maxSteps. |
+| Agent / AgentVersion | Stable owner-scoped identity; immutable external integration configuration and exact manifest bindings. Reusing a version identity with different content is rejected; a new version may change configuration. External versions need no provider, model, system prompt or Foundry maxSteps. |
 | ToolManifest / tool revision | Immutable validated data: tool identity, bounded input/output schemas, handler ID, artifact digest, declared effects, resources and limits. No uploaded JS closures. Operator-reviewed classification is distinct from the submitted label. |
 | ExecutorDeployment | Owner, environment, executor identity, installed manifest/tool revisions and artifact digests, resource mappings, isolation/trust tier and enabled/revoked state. Agent cannot modify handler installation. |
 | CapabilityGrant | Mutable/revocable authorization binding agent/version, exact tool revision, deployment/environment, permitted resource constraints, reviewed profile, limits and policy revision. A manifest is not a grant. |
@@ -303,7 +314,9 @@ missing isolation approval, DB outage or stale authorization: do not start.
 
 ## 8. Public API / TypeScript SDK contract
 
-**PROPOSED illustrative API; no routes or SDK below exist yet.** Every operation
+**PROPOSED illustrative target API; routes in this table and the SDK do not exist.**
+The narrower implemented `/api/v1/external` routes and actual scopes are documented
+in the [current pipeline](../architecture/execution-pipeline.md#11-current-integration-versus-future-contract). Every proposed operation
 authenticates, checks owner and resource scope, validates size and records relevant
 decisions. Caller-supplied tenant IDs cannot override credential ownership.
 

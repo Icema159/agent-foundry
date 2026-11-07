@@ -1,0 +1,128 @@
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { request as httpRequest } from "node:http";
+import type { AddressInfo } from "node:net";
+import test from "node:test";
+import { createPrismaClient } from "../src/persistence/prisma-execution-store.js";
+import { PrismaIdentityStore } from "../src/identity/prisma-identity-store.js";
+import { CredentialAuthenticator, TrustedCredentialIssuer, TrustedIdentityAdministration } from "../src/identity/identity.js";
+import { AgentRegistry } from "../src/identity/agent-registry.js";
+import { ExternalRegistry } from "../src/registry/external-registry.js";
+import { InvocationService } from "../src/invocation/invocation-service.js";
+import { createExternalApiServer } from "../src/external-api/server.js";
+
+const url = process.env.FOUNDRY_11D_TEST_DATABASE_URL;
+test("external HTTP API authenticates, scopes, reconciles and never dispatches", { skip: !url }, async () => {
+  const parsed = new URL(url!);
+  if (!["127.0.0.1", "localhost", "::1"].includes(parsed.hostname) || !/^\/foundry_11d_test_[a-z0-9]+$/.test(parsed.pathname)) throw new Error("Dedicated local foundry_11d_test_* database required");
+  const db = createPrismaClient(url!);
+  const store = new PrismaIdentityStore(db), admin = new TrustedIdentityAdministration(store), issuer = new TrustedCredentialIssuer(store);
+  const auth = new CredentialAuthenticator(store), registry = new AgentRegistry(store), external = new ExternalRegistry(db), service = new InvocationService(db);
+  const server = createExternalApiServer({ auth, invocations: service });
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+  const port = (server.address() as AddressInfo).port, origin = `http://127.0.0.1:${port}`, prefix = "/api/v1/external";
+  try {
+    const expiry = new Date(Date.now() + 600000), owner = await admin.createOwner("api test"), otherOwner = await admin.createOwner("api other");
+    const op = await admin.createPrincipal({ ownerId: owner.id, type: "OPERATOR" });
+    const opCredential = await issuer.issue({ principalId: op.id, scopes: ["agent:register", "version:publish", "manifest:publish", "deployment:manage", "grant:manage"], expiresAt: expiry });
+    const opContext = await auth.authenticate(opCredential.secret), agentRecord = await registry.register(opContext, { name: `api-${randomUUID()}` });
+    const sibling = await registry.register(opContext, { name: `sibling-${randomUUID()}` });
+    const version = await external.publishVersion(opContext, { agentId: agentRecord.id, version: 1, config: { name: "test" } });
+    const schema = { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false };
+    const manifest = await external.publishManifest(opContext, { versionId: version.id, revision: 1, manifest: { tools: [{ name: "read", revision: 1, description: "read", inputSchema: schema, declaredProfile: "READ_ONLY", handlerId: "read" }] } });
+    const dep = await external.registerDeployment(opContext, { name: "executor", environment: "test" });
+    const grant = await external.grant(opContext, { versionId: version.id, toolId: manifest.tools[0]!.id, deploymentId: dep.id, reviewedProfile: "READ_ONLY", allowedResources: ["resource"] });
+    const agent = await admin.createPrincipal({ ownerId: owner.id, type: "AGENT", agentId: agentRecord.id });
+    const credential = await issuer.issue({ principalId: agent.id, scopes: ["run:manage", "invocation:request"], expiresAt: expiry });
+    const limited = await issuer.issue({ principalId: agent.id, scopes: ["run:manage"], expiresAt: expiry });
+    const siblingP = await admin.createPrincipal({ ownerId: owner.id, type: "AGENT", agentId: sibling.id });
+    const siblingToken = await issuer.issue({ principalId: siblingP.id, scopes: ["run:manage", "invocation:request"], expiresAt: expiry });
+    const otherOp = await admin.createPrincipal({ ownerId: otherOwner.id, type: "OPERATOR" });
+    const otherCred = await issuer.issue({ principalId: otherOp.id, scopes: ["agent:register"], expiresAt: expiry });
+    const otherAgent = await registry.register(await auth.authenticate(otherCred.secret), { name: `other-${randomUUID()}` });
+    const otherP = await admin.createPrincipal({ ownerId: otherOwner.id, type: "AGENT", agentId: otherAgent.id });
+    const otherToken = await issuer.issue({ principalId: otherP.id, scopes: ["run:manage", "invocation:request"], expiresAt: expiry });
+    const executor = await admin.createPrincipal({ ownerId: owner.id, type: "EXECUTOR", deploymentId: dep.id });
+    const executorToken = await issuer.issue({ principalId: executor.id, scopes: ["executor:identify"], expiresAt: expiry });
+    const expired = await issuer.issue({ principalId: agent.id, scopes: ["run:manage"], expiresAt: new Date(Date.now() - 60000) }, new Date(Date.now() - 120000));
+    async function call(path: string, options: { method?: string; token?: string; body?: unknown; raw?: string; contentType?: string } = {}) {
+      const headers: Record<string, string> = {};
+      if (options.token !== undefined) headers.authorization = `Bearer ${options.token}`;
+      if (options.body !== undefined || options.raw !== undefined) headers["content-type"] = options.contentType ?? "application/json";
+      const response = await fetch(origin + prefix + path, { method: options.method ?? "GET", headers,
+        ...((options.body !== undefined || options.raw !== undefined) ? { body: options.raw ?? JSON.stringify(options.body) } : {}) });
+      const result = await response.json() as any;
+      return { status: response.status, result, raw: JSON.stringify(result) };
+    }
+    const agentToken = credential.secret;
+    assert.equal((await call("/runs")).status, 401);
+    assert.equal((await call("/runs", { token: "bad" })).status, 401);
+    assert.equal((await call("/runs", { token: expired.secret })).status, 401);
+    assert.equal((await call("/runs", { token: opCredential.secret })).status, 403);
+    assert.equal((await call("/runs", { token: executorToken.secret })).status, 403);
+    assert.equal((await call("/runs", { method: "POST", token: agentToken, body: { versionId: version.id, ownerId: otherOwner.id } })).status, 400);
+    assert.equal((await call("/runs", { method: "POST", token: agentToken, raw: "{", contentType: "application/json" })).status, 400);
+    assert.equal((await call("/runs", { method: "POST", token: agentToken, raw: "{}", contentType: "text/plain" })).status, 415);
+    assert.equal((await call("/runs", { method: "POST", token: agentToken, raw: JSON.stringify({ x: "x".repeat(66000) }) })).status, 413);
+    assert.equal((await call("/runs", { method: "PUT", token: agentToken })).status, 405);
+    assert.equal((await call("/invocations/invalid!/start", { method: "POST", token: agentToken, body: {} })).status, 404);
+
+    // Stream without Content-Length: response must be 413, not a connection reset.
+    const chunkedStatus = await new Promise<number>((resolve, reject) => {
+      const req = httpRequest({ host: "127.0.0.1", port, path: `${prefix}/runs`, method: "POST", headers: { authorization: `Bearer ${agentToken}`, "content-type": "application/json", "transfer-encoding": "chunked" } }, res => { res.resume(); res.on("end", () => resolve(res.statusCode!)); });
+      req.on("error", reject); req.write("x".repeat(34000)); req.write("x".repeat(34000)); req.end();
+    });
+    assert.equal(chunkedStatus, 413);
+    const created = await call("/runs", { method: "POST", token: agentToken, body: { versionId: version.id } });
+    assert.equal(created.status, 201); const runId = created.result.run.id as string;
+    assert.equal(created.result.run.status, "RUNNING");
+    assert.equal((await call(`/runs/${runId}`, { token: agentToken })).status, 200);
+    assert.equal((await call(`/runs/${runId}`, { token: siblingToken.secret })).status, 404);
+    assert.equal((await call(`/runs/${runId}`, { token: otherToken.secret })).status, 404);
+    assert.equal((await call("/runs/not%21valid", { token: agentToken })).status, 400);
+    assert.equal((await call(`/runs/${runId}/history`, { token: limited.secret })).status, 403);
+    const input = { idempotencyKey: "key-1", toolId: manifest.tools[0]!.id, deploymentId: dep.id, grantId: grant.id, arguments: { path: "PRIVATE_INPUT" } };
+    const responses = await Promise.all(Array.from({ length: 4 }, () => call(`/runs/${runId}/invocations`, { method: "POST", token: agentToken, body: input })));
+    assert.ok(responses.every(r => r.status === 200));
+    assert.equal(new Set(responses.map(r => r.result.invocation.id)).size, 1);
+    const inv = responses[0]!.result.invocation; assert.equal(inv.status, "REQUESTED"); assert.equal(inv.reason, "RESOURCE_BINDING_UNVERIFIED"); assert.equal(inv.executionAllowed, false);
+    assert.doesNotMatch(responses[0]!.raw, /PRIVATE_INPUT|fingerprint|verifier|ownerId|principalId|credentialId|arguments/);
+    assert.equal((await call(`/invocations/${inv.id}`, { token: agentToken })).status, 200);
+    assert.equal((await call(`/invocations/${inv.id}`, { token: siblingToken.secret })).status, 404);
+    assert.equal((await call(`/invocations/${inv.id}/cancel`, { method: "POST", token: otherToken.secret, body: {} })).status, 404);
+    const conflicting = await call(`/runs/${runId}/invocations`, { method: "POST", token: agentToken, body: { ...input, arguments: { path: "changed" } } });
+    assert.equal(conflicting.status, 409); assert.equal(conflicting.result.error.code, "IDEMPOTENCY_CONFLICT");
+    assert.equal((await call(`/runs/${runId}/close`, { method: "POST", token: agentToken, body: {} })).status, 409);
+    const page1 = await call(`/runs/${runId}/history?limit=1`, { token: agentToken }); assert.equal(page1.result.events.length, 1); assert.doesNotMatch(page1.raw, /PRIVATE_INPUT|actorPrincipalId/);
+    const cancelled = await call(`/invocations/${inv.id}/cancel`, { method: "POST", token: agentToken, body: {} }); assert.equal(cancelled.result.invocation.status, "REVOKED");
+    const page2 = await call(`/runs/${runId}/history?limit=1&after=${page1.result.nextCursor}`, { token: agentToken }); assert.equal(page2.result.events.length, 1); assert.equal(page2.result.events[0].status, "REVOKED");
+    assert.notEqual(page1.result.nextCursor, page2.result.nextCursor);
+    assert.equal((await call(`/runs/${runId}/history?limit=101`, { token: agentToken })).status, 400);
+    assert.equal((await call(`/runs/${runId}/history?after=99999999999999999999`, { token: agentToken })).status, 400);
+    assert.equal((await call(`/runs/${runId}/history?after=0&after=1`, { token: agentToken })).status, 400);
+    const another = await call("/runs", { method: "POST", token: agentToken, body: { versionId: version.id } }); const anotherRun = another.result.run.id;
+    assert.equal((await call(`/runs/${anotherRun}/history?after=${page1.result.nextCursor}`, { token: agentToken })).status, 400);
+    assert.equal((await call(`/runs/${runId}/history`, { token: otherToken.secret })).status, 404);
+    const denied = await call(`/runs/${runId}/invocations`, { method: "POST", token: agentToken, body: { ...input, idempotencyKey: "no-grant", grantId: undefined } });
+    assert.equal(denied.result.invocation.status, "DENIED");
+    const unknownRequest = await call(`/runs/${anotherRun}/invocations`, { method: "POST", token: agentToken, body: { ...input, idempotencyKey: "unknown" } });
+    await db.invocation.update({ where: { id: unknownRequest.result.invocation.id }, data: { status: "UNKNOWN", reason: "TEST_FIXTURE" } });
+    await db.invocationEvent.create({ data: { runId: anotherRun, invocationId: unknownRequest.result.invocation.id, actorPrincipalId: agent.id, kind: "TEST_FIXTURE", status: "UNKNOWN", reason: "TEST_FIXTURE" } });
+    assert.equal((await call(`/invocations/${unknownRequest.result.invocation.id}`, { token: agentToken })).result.invocation.status, "UNKNOWN");
+    assert.deepEqual((await call(`/runs/${anotherRun}/history`, { token: agentToken })).result.events.map((event: { status: string }) => event.status), ["REQUESTED", "UNKNOWN"]);
+    assert.equal((await call(`/runs/${anotherRun}/close`, { method: "POST", token: agentToken, body: {} })).status, 409);
+    const concurrentRun = (await call("/runs", { method: "POST", token: agentToken, body: { versionId: version.id } })).result.run.id;
+    const concurrent = await Promise.all(["one", "two"].map(idempotencyKey => call(`/runs/${concurrentRun}/invocations`, { method: "POST", token: agentToken, body: { ...input, idempotencyKey } })));
+    assert.deepEqual(concurrent.map(result => result.status).sort(), [200, 409]);
+    assert.equal(await db.invocation.count({ where: { runId: concurrentRun } }), 1);
+    await external.revoke(opContext, grant.id);
+    assert.equal((await call(`/runs/${runId}/close`, { method: "POST", token: agentToken, body: {} })).status, 200);
+    assert.equal((await call(`/runs/${runId}/invocations`, { method: "POST", token: agentToken, body: input })).result.invocation.id, inv.id);
+    assert.equal((await call(`/runs/${runId}/invocations`, { method: "POST", token: agentToken, body: { ...input, idempotencyKey: "fresh" } })).status, 409);
+    await admin.revokeCredential(credential.credentialId);
+    assert.equal((await call(`/runs/${runId}`, { token: agentToken })).status, 401);
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await db.$disconnect();
+  }
+});
