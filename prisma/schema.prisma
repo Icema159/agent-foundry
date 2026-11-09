@@ -56,6 +56,7 @@ model Owner {
   deployments ExecutorDeployment[]
   grants CapabilityGrant[]
   resourceBindings TrustedResourceBinding[]
+  executorClaims ExecutorClaim[]
   createdAt  DateTime    @default(now())
 }
 
@@ -70,6 +71,10 @@ model Principal {
   credentials  Credential[]
   issuedGrants CapabilityGrant[]
   approvedBindings TrustedResourceBinding[]
+  executorClaims ExecutorClaim[]
+  executorSessions ExecutorSession[]
+  reconciliationFindings OperatorFinding[]
+  externalApprovalDecisions ExternalApprovalDecision[]
   createdAt    DateTime      @default(now())
 
   @@index([ownerId])
@@ -87,8 +92,13 @@ model Credential {
   createdAt  DateTime  @default(now())
 
   invocationAuthorizations InvocationAuthorization[]
+  executorClaims ExecutorClaim[]
+  executorSessions ExecutorSession[]
+  reconciliationFindings OperatorFinding[]
+  externalApprovalDecisions ExternalApprovalDecision[]
 
   @@index([principalId])
+  @@unique([principalId, id])
 }
 
 model Agent {
@@ -183,6 +193,8 @@ model ExecutorDeployment {
   grants CapabilityGrant[]
   invocations Invocation[]
   resourceBindings TrustedResourceBinding[]
+  claims ExecutorClaim[]
+  sessions ExecutorSession[]
 
   @@unique([ownerId, name, environment])
   @@unique([ownerId, id])
@@ -222,6 +234,9 @@ model TrustedResourceBinding {
   revision Int
   mode String
   artifactDigest String
+  executionProfile String?
+  outputResource String?
+  ledgerId String?
   toolDigest String
   deploymentDigest String
   approvedByPrincipalId String
@@ -230,9 +245,12 @@ model TrustedResourceBinding {
   revokedAt DateTime?
   createdAt DateTime @default(now())
   authorizations InvocationAuthorization[]
+  sessions ExecutorSession[]
+  ledgerAnchor ExecutorLedgerAnchor?
 
   @@unique([toolId, deploymentId, revision])
   @@index([ownerId, versionId, toolId, deploymentId, revokedAt])
+  @@unique([ownerId, deploymentId, id])
 }
 
 model InvocationAuthorization {
@@ -246,8 +264,109 @@ model InvocationAuthorization {
   snapshot Json
   digest String
   createdAt DateTime @default(now())
+  claims ExecutorClaim[]
 
   @@unique([runId, invocationId])
+  @@unique([invocationId, digest])
+}
+
+enum ExecutorClaimStatus {
+  ACTIVE
+  RELEASED
+  EXPIRED
+  REVOKED
+}
+
+model ExecutorClaim {
+  id String @id @default(cuid())
+  ownerId String
+  owner Owner @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  runId String
+  invocationId String
+  invocation Invocation @relation(fields: [ownerId, deploymentId, runId, invocationId], references: [ownerId, deploymentId, runId, id], onDelete: Restrict)
+  deploymentId String
+  deployment ExecutorDeployment @relation(fields: [ownerId, deploymentId], references: [ownerId, id], onDelete: Restrict)
+  executorPrincipalId String
+  executor Principal @relation(fields: [ownerId, executorPrincipalId], references: [ownerId, id], onDelete: Restrict)
+  credentialId String
+  credential Credential @relation(fields: [executorPrincipalId, credentialId], references: [principalId, id], onDelete: Restrict)
+  requestKey String
+  authorizationDigest String
+  authorization InvocationAuthorization @relation(fields: [invocationId, authorizationDigest], references: [invocationId, digest], onDelete: Restrict)
+  generation Int
+  status ExecutorClaimStatus @default(ACTIVE)
+  leaseExpiresAt DateTime
+  startAuthorizedAt DateTime?
+  sessionId String?
+  session ExecutorSession? @relation(fields: [ownerId, deploymentId, executorPrincipalId, credentialId, sessionId], references: [ownerId, deploymentId, executorPrincipalId, credentialId, id], onDelete: Restrict)
+  starts ExecutorStart[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  closedAt DateTime?
+
+  @@unique([invocationId, generation])
+  @@unique([ownerId, executorPrincipalId, requestKey])
+  @@index([ownerId, deploymentId, status, leaseExpiresAt])
+  @@unique([invocationId, id, generation, sessionId])
+}
+
+model ExecutorSession {
+  id String @id @default(cuid())
+  ownerId String
+  deploymentId String
+  deployment ExecutorDeployment @relation(fields: [ownerId, deploymentId], references: [ownerId, id], onDelete: Restrict)
+  executorPrincipalId String
+  executor Principal @relation(fields: [ownerId, executorPrincipalId], references: [ownerId, id], onDelete: Restrict)
+  credentialId String
+  credential Credential @relation(fields: [executorPrincipalId, credentialId], references: [principalId, id], onDelete: Restrict)
+  bindingId String
+  binding TrustedResourceBinding @relation(fields: [ownerId, deploymentId, bindingId], references: [ownerId, deploymentId, id], onDelete: Restrict)
+  sessionKey String
+  requestDigest String
+  artifactDigest String
+  ledgerId String
+  executionProfile String
+  generation Int
+  active Boolean @default(true)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  claims ExecutorClaim[]
+
+  @@unique([ownerId, deploymentId, sessionKey])
+  @@unique([ownerId, deploymentId, generation])
+  @@unique([ownerId, deploymentId, executorPrincipalId, credentialId, id])
+}
+
+model ExecutorStart {
+  id String @id @default(cuid())
+  invocationId String @unique
+  invocation Invocation @relation(fields: [invocationId], references: [id], onDelete: Restrict)
+  claimId String @unique
+  generation Int
+  sessionId String
+  claim ExecutorClaim @relation(fields: [invocationId, claimId, generation, sessionId], references: [invocationId, id, generation, sessionId], onDelete: Restrict)
+  requestKey String
+  requestDigest String
+  authorizationDigest String
+  artifactDigest String
+  startDeadline DateTime
+  resultDeadline DateTime
+  createdAt DateTime @default(now())
+  reports ExecutorReport[]
+  approvalConsumption ExternalApprovalConsumption?
+}
+
+model ExecutorReport {
+  id String @id @default(cuid())
+  startId String
+  start ExecutorStart @relation(fields: [startId], references: [id], onDelete: Restrict)
+  outcome InvocationStatus
+  reason String
+  result Json?
+  digest String
+  createdAt DateTime @default(now())
+
+  @@unique([startId, digest])
 }
 
 enum ExternalRunStatus {
@@ -305,10 +424,15 @@ model Invocation {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   events InvocationEvent[]
+  operatorFindings OperatorFinding[]
+  externalApproval ExternalApprovalRequest?
   authorization InvocationAuthorization?
+  claims ExecutorClaim[]
+  start ExecutorStart?
 
   @@unique([ownerId, runId, idempotencyKey])
   @@unique([runId, id])
+  @@unique([ownerId, deploymentId, runId, id])
 }
 
 model InvocationEvent {
@@ -321,9 +445,18 @@ model InvocationEvent {
   status InvocationStatus
   reason String
   authorization Json?
+  claimId String?
+  claimGeneration Int?
+  leaseExpiresAt DateTime?
+  startId String?
+  reportId String?
+  executionResult Json?
+  findingId String?
+  externalApprovalId String?
   createdAt DateTime @default(now())
 
   @@index([runId, sequence])
+  @@index([invocationId, sequence])
 }
 
 model AgentVersion {
@@ -419,4 +552,73 @@ model EvalRun {
   completedAt    DateTime?
 
   @@index([caseId, createdAt])
+}
+
+
+// Installation continuity marker. Never reset when replacing a container.
+model ExecutorLedgerAnchor {
+  bindingId String @id
+  binding TrustedResourceBinding @relation(fields: [bindingId], references: [id], onDelete: Restrict)
+  proofDigest String
+  createdAt DateTime @default(now())
+}
+
+// An operator finding is not an execution result or permission to retry.
+model OperatorFinding {
+  id String @id @default(cuid())
+  invocationId String
+  invocation Invocation @relation(fields: [invocationId], references: [id], onDelete: Restrict)
+  ownerId String
+  actorPrincipalId String
+  actor Principal @relation(fields: [ownerId, actorPrincipalId], references: [ownerId, id], onDelete: Restrict)
+  credentialId String
+  credential Credential @relation(fields: [actorPrincipalId, credentialId], references: [principalId, id], onDelete: Restrict)
+  requestKey String
+  requestDigest String
+  basisSequence BigInt
+  decision String
+  reason String
+  evidence Json
+  createdAt DateTime @default(now())
+
+  @@unique([ownerId, invocationId, requestKey])
+  @@unique([invocationId, basisSequence])
+}
+
+
+model ExternalApprovalRequest {
+  id String @id @default(cuid())
+  invocationId String @unique
+  invocation Invocation @relation(fields: [invocationId], references: [id], onDelete: Restrict)
+  ownerId String
+  authorizationDigest String
+  identity Json
+  digest String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  decision ExternalApprovalDecision?
+  consumption ExternalApprovalConsumption?
+}
+
+model ExternalApprovalDecision {
+  approvalId String @id
+  approval ExternalApprovalRequest @relation(fields: [approvalId], references: [id], onDelete: Restrict)
+  ownerId String
+  actorPrincipalId String
+  actor Principal @relation(fields: [ownerId, actorPrincipalId], references: [ownerId, id], onDelete: Restrict)
+  credentialId String
+  credential Credential @relation(fields: [actorPrincipalId, credentialId], references: [principalId, id], onDelete: Restrict)
+  requestKey String
+  requestDigest String
+  decision String
+  reason String
+  createdAt DateTime @default(now())
+}
+
+model ExternalApprovalConsumption {
+  approvalId String @id
+  approval ExternalApprovalRequest @relation(fields: [approvalId], references: [id], onDelete: Restrict)
+  startId String @unique
+  start ExecutorStart @relation(fields: [startId], references: [id], onDelete: Restrict)
+  createdAt DateTime @default(now())
 }

@@ -305,7 +305,8 @@ authorization, isolation, verification and observability. Provider-agnostic mode
 calls do not make the whole platform agent-agnostic.
 
 Phases 11.1a–11.1d add local identity/registry, external-run and authenticated HTTP
-control-plane foundations; external tool execution and general BYOA remain **NOT IMPLEMENTED**.
+control-plane foundations. Phase 11.2c additionally implements only fixed isolated
+health_ping execution and Phase 11.3 adds controlled approved receipt WRITE; general BYOA and arbitrary tools remain **NOT IMPLEMENTED**.
 [`agent-contract.md`](../design/agent-contract.md) documents the proposed design.
 
 [`identity.ts`](../../src/identity/identity.ts) defines operator, agent and executor
@@ -387,17 +388,15 @@ invocation across REQUESTED, READY, PENDING_APPROVAL, CLAIMED, START_AUTHORIZED,
 RUNNING and UNKNOWN. Events and state commit together; a DB sequence orders events
 within a locked run, with gaps possible.
 
-No matching active grant yields a durable DENIED receipt. A candidate grant yields
-REQUESTED with `RESOURCE_BINDING_UNVERIFIED`, never READY: no caller-provided resource
-establishes execution permission. An agent may cancel only this blocked REQUESTED
-state to REVOKED and close a run only with no active/UNKNOWN invocation. No service
-transitions to approval, claim, start, success, failure or UNKNOWN are enabled; the
-enum reserves future states. UNKNOWN stays active and cannot be cancelled or retried.
-Run COMPLETED means only that the developer closed orchestration with no unresolved
-invocation; it does not assert that denied actions or the task itself succeeded.
-No queue or executor is added. Credential/grant revocation is not
-serialized with an in-flight admission. A future start boundary must transactionally
-reauthorize and independently bind validated arguments to protected resources.
+No matching active grant yields a durable DENIED receipt. An unsupported binding
+yields REQUESTED / RESOURCE_BINDING_UNVERIFIED. Supported operator-approved
+resource-free READ_ONLY requests may reach READY, then the executor-only protocol
+below owns claims, starts and reported results. PENDING_APPROVAL remains blocked.
+An agent may cancel only blocked REQUESTED to REVOKED and close a run only with no
+active/UNKNOWN Invocation. UNKNOWN cannot be cancelled or automatically retried.
+Run COMPLETED means only that the developer closed orchestration without unresolved
+Invocations; it does not independently verify the task or side effects. External
+Invocations never enter the reference worker/BullMQ execution pipeline.
 
 Phase 11.1d adds [`external-api/server.ts`](../../src/external-api/server.ts), a
 separate versioned HTTP adapter around InvocationService. The entry point
@@ -405,7 +404,7 @@ separate versioned HTTP adapter around InvocationService. The entry point
 port 3002); network exposure requires TLS termination and protected proxy routing.
 Never expose the unrelated unauthenticated dashboard as the external API.
 
-Each request authenticates a Bearer credential anew, requires an AGENT principal
+Each agent-facing request authenticates a Bearer credential anew, requires an AGENT principal
 and appropriate `run:manage` or `invocation:request` scope; services recheck
 current credentials and scope resources by owner plus bound agent. Malformed,
 expired and revoked credentials get 401, wrong role/scope 403, inaccessible or
@@ -430,14 +429,27 @@ run; `nextCursor` is the last returned sequence and may be reused to poll for la
 events even when `hasMore` is false. Gaps in global sequence numbers are normal.
 Event status reflects the recorded transition; use GET invocation for current state.
 History is reconciliation data, not an agent reasoning checkpoint. There is no
-API for approvals, execution, credential issuance or grants.
+agent API for approvals, start permission, credential issuance or grants.
 
 Phase 11.2a adds operator-attested resource-free READ_ONLY eligibility and immutable
 Invocation authorization evidence. Supported requests may reach READY or blocked
 PENDING_APPROVAL; unverifiable resources retain RESOURCE_BINDING_UNVERIFIED. No
-external execution or start endpoint is enabled, and public receipts still report
+agent-facing execution or start endpoint is enabled, and public receipts still report
 `executionAllowed: false`. See [external authorization](external-authorization.md)
 for the exact supported schema, policy/revocation locks, start-time guard and limits.
+
+Phase 11.2b adds a separate authenticated `/api/v1/executor` namespace for bounded
+polling, durable pre-start claim/inspection, renewal and release. Assignment IDs,
+lease generations/deadlines and protocol events live in PostgreSQL, independent of
+reference worker leases. New explicit executor scopes are required. Phase 11.2c
+adds a fixed isolated health_ping runner, per-process sessions, atomic start, durable
+local ledger and executor-only result ACKs. Generic handlers, external approvals and
+write execution remain disabled. See [executor protocol](executor-protocol.md) for
+endpoints, isolation topology, crash/UNKNOWN semantics and safe deployment.
+Phase 11.2d adds ledger continuity validation and operator-only audited findings;
+UNKNOWN still never authorizes retry. Phase 11.3 adds dedicated external approval
+records and one bounded demo WRITE handler, separate from TaskRun approval resume;
+see [external approvals](external-approvals.md). See [operational recovery](../operations/executor-recovery.md).
 
 Dedicated subsystem architecture documents should be extracted from this map
 only when justified, with links instead of duplicated explanations.

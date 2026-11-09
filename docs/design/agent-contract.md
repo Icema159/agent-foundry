@@ -9,14 +9,21 @@ authoritative for implemented Repository Explorer behavior.
 
 Phases 11.1a–11.1d implement identity, registry, external-run, blocked Invocation
 admission and an authenticated loopback HTTP API, documented in the current pipeline.
-Remote execution and approval below remain proposed. Deployment metadata does not
+Generic remote execution and approval below remain proposed. Deployment metadata does not
 provision an executor or verify isolation. Capability decisions are preliminary and
 cannot authorize execution until actual arguments/resources are independently bound.
 
 Phase 11.2a implements only the narrow operator-attested resource-free eligibility
 and reauthorization foundation described in [external authorization](../architecture/external-authorization.md).
-READY can now represent that supported case; every actual executor claim/start,
-approval decision and execution protocol below remains **PROPOSED / NOT IMPLEMENTED**.
+READY can now represent that supported case. Phase 11.2b adds the implemented
+[executor polling/claim/lease foundation](../architecture/executor-protocol.md).
+Phase 11.2c implements a fixed health_ping isolated runner, atomic start, SQLite
+ledger and durable result ACKs. Phase 11.2d implements continuity checks and
+operator findings that retain uncertainty; result import remains deferred. Phase 11.3
+implements one exact external approval and isolated demo WRITE path, documented in
+[external approvals](../architecture/external-approvals.md). Generic handlers and
+SDK below remain **PROPOSED / NOT IMPLEMENTED**; the narrower implemented routes
+are documented in the architecture, not the illustrative target API below.
 
 **Developer owns intelligence. Foundry owns execution.** Here, execution means
 capabilities delegated through Foundry's enforced boundary, not everything an agent

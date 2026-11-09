@@ -1,11 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
 
 export type PrincipalType = "OPERATOR" | "AGENT" | "EXECUTOR";
-export type Scope = "agent:register" | "agent:read" | "executor:identify" | "version:publish" | "manifest:publish" | "deployment:manage" | "grant:manage" | "capability:check" | "run:manage" | "invocation:request";
+export type Scope = "operator:approve" | "operator:reconcile" | "agent:register" | "agent:read" | "executor:identify" | "executor:claim" | "executor:lease" | "executor:session" | "executor:start" | "executor:report" | "version:publish" | "manifest:publish" | "deployment:manage" | "grant:manage" | "capability:check" | "run:manage" | "invocation:request";
 const allowed: Record<PrincipalType, readonly Scope[]> = {
-  OPERATOR: ["agent:register", "agent:read", "version:publish", "manifest:publish", "deployment:manage", "grant:manage", "capability:check"],
+  OPERATOR: ["operator:approve", "operator:reconcile", "agent:register", "agent:read", "version:publish", "manifest:publish", "deployment:manage", "grant:manage", "capability:check"],
   AGENT: ["agent:read", "version:publish", "manifest:publish", "capability:check", "run:manage", "invocation:request"],
-  EXECUTOR: ["executor:identify"],
+  EXECUTOR: ["executor:identify", "executor:claim", "executor:lease", "executor:session", "executor:start", "executor:report"],
 };
 
 export type Principal = {

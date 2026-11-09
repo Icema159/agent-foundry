@@ -97,16 +97,25 @@ npm run external-api
 ```
 
 It listens on `127.0.0.1:3002` by default; set `FOUNDRY_EXTERNAL_API_PORT` to
-change the port. The API requires a scoped agent Bearer credential created through
+change the port. Agent routes require a scoped agent Bearer credential created through
 the trusted in-process administration boundary. Network exposure requires a trusted
 TLS terminator and protected routing; do not expose the local dashboard. See the
 [external API contract and limits](docs/architecture/execution-pipeline.md#11-current-integration-versus-future-contract).
 
-Phase 11.2a adds a deliberately narrow operator-approved resource-free READ_ONLY
-binding. Eligible Invocations can be READY, but `executionAllowed` remains false:
-there is still no remote executor or start/approval endpoint. Binding configuration
-is trusted local administration, not agent input. Apply the new migration before
-starting upgraded API code; see [authorization scope and limitations](docs/architecture/external-authorization.md).
+Phases 11.2a–d add operator-approved resource-free READ_ONLY bindings, authenticated
+executor claims/leases and one real isolated `health_ping({})` execution path. The
+Docker runner verifies its artifact, fences sessions, commits start permission
+atomically, tracks starts/results in a durable SQLite ledger and receives DB-backed
+result ACKs. Phase 11.3 adds authenticated operator approvals and one controlled demo receipt
+WRITE in its own protected volume. Generic remote handlers, filesystem writes, DELETE
+and EXTERNAL_WRITE remain disabled. See [external approvals](docs/architecture/external-approvals.md).
+Agent receipts, polls and claims are never execution permission. Existing bindings
+remain metadata-only unless explicitly provisioned for the fixed execution profile.
+See [authorization](docs/architecture/external-authorization.md) and the
+[executor protocol, isolated test and deployment instructions](docs/architecture/executor-protocol.md).
+Ledger continuity checks and authenticated operator investigation now cover missing/
+stale storage and unresolved execution; findings preserve UNKNOWN. See the
+[recovery runbooks](docs/operations/executor-recovery.md). No live migration or service restart is automatic.
 
 Terminal 3 — submit a read-only task:
 
@@ -175,6 +184,8 @@ Never commit `.env` or credentials. Use a new AgentVersion number for changed mo
 | `FOUNDRY_CONTEXT_SAFETY_MARGIN_TOKENS` | `1024` |
 | `FOUNDRY_HEARTBEAT_INTERVAL_MS` | `5000` |
 | `FOUNDRY_LEASE_TIMEOUT_MS` | `30000` |
+| `FOUNDRY_ISOLATED_EXECUTION_ENABLED` | `false`; explicit fixed-handler start opt-in for verified isolation only |
+| `FOUNDRY_EXECUTOR_LEASE_MS` | `30000`; external pre-start claims only, range `1000`–`120000` |
 | `FOUNDRY_MAX_RECOVERIES` | `2` |
 | `FOUNDRY_SANDBOX_IMAGE` | `agent-foundry-sandbox:phase7` |
 | `FOUNDRY_SANDBOX_TIMEOUT_MS` | `10000` |
@@ -228,8 +239,9 @@ Automated tests use fake model providers and do not require real Ollama/OpenAI A
 ## Direction
 
 External-agent identity, registration, immutable configuration, grants and a blocked
-Invocation control-plane API are implemented. **PROPOSED / NOT IMPLEMENTED:**
-remote tool execution and complete Bring Your Own Agent / Bring Your Own Tools.
+Invocation control-plane API and one isolated resource-free READ_ONLY executor are
+implemented. **PROPOSED / NOT IMPLEMENTED:** generic remote tools, external approvals
+and complete Bring Your Own Agent / Bring Your Own Tools.
 The current CLI/worker remain coupled to Repository Explorer; no multi-agent
 orchestration or external-agent hosting is implemented.
 

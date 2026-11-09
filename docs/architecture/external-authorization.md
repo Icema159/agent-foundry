@@ -1,7 +1,10 @@
 # External Invocation authorization — Phase 11.2a
 
-Implemented eligibility foundation only. No executor, dispatch, claim, start permit,
-approval decision or handler execution exists. The reference runtime is unchanged.
+Implemented: the resource-free READ_ONLY foundation and one controlled demo WRITE
+binding with exact external approvals. Generic resource interpretation, arbitrary
+handlers, DELETE and EXTERNAL_WRITE remain disabled. See [external approvals](external-approvals.md)
+for the authoritative WRITE binding, lifecycle and atomic consumption contract.
+The [executor protocol](executor-protocol.md) owns isolated runtime delivery.
 The [execution pipeline](execution-pipeline.md#11-current-integration-versus-future-contract)
 owns the surrounding identity, registry, API and history contract.
 
@@ -12,7 +15,7 @@ requiring `grant:manage`. It is not exposed through HTTP. The operator explicitl
 attests that a pinned handler artifact in an exact deployment is resource-free and
 READ_ONLY. A manifest's READ_ONLY label and an empty schema alone never suffice.
 
-The only supported binding mode is `RESOURCE_FREE_READ_ONLY_V1`. Its exact input
+The original READ_ONLY binding mode is `RESOURCE_FREE_READ_ONLY_V1`. Its exact input
 schema is `{ "type": "object", "properties": {}, "additionalProperties": false }`
 and its validated arguments must be `{}`. No paths, URLs, aliases, selectors,
 encoded targets, optional parameters or generic resource resolver are supported.
@@ -22,9 +25,11 @@ grant ownership, agent version, tool record and deployment still constrain that 
 The operator-approved record pins the tool record/digest, deployment identity and
 environment digest, a SHA-256 handler artifact digest, positive binding revision,
 approving principal and expiry. The artifact digest is operator attestation, **not**
-proof of installed code or execution isolation. No filesystem/network inspection is
-pretended. Mode 1 trusts the operator and host administrator. Future executors must
-verify the actual protected artifact and isolation before this can support a start.
+proof of installed code or execution isolation. Mode 1 trusts the operator and host
+administrator. The fixed 11.2c runner additionally verifies its local protected
+artifact and Docker profile, without claiming independent host attestation. Its
+optional execution profile/ledger identity are included in new snapshots; old
+metadata-only snapshot fingerprints remain unchanged.
 
 Bindings are immutable except monotonic revocation. Only one non-revoked binding
 may exist per tool/deployment; revoke an expired binding before publishing another
@@ -45,15 +50,15 @@ revoked; it does not rerun authorization or upgrade the earlier request.
 | Trusted resource-free binding, matching grant and READ_ONLY reviewed profile | READY / RESOURCE_AUTHORIZED |
 | Same supported binding but grant reviewed as WRITE, DESTRUCTIVE or EXTERNAL_WRITE | PENDING_APPROVAL / APPROVAL_REQUIRED |
 
-Non-READ_ONLY declared tools cannot obtain the current binding type. They stay
+Non-READ_ONLY declared tools cannot obtain the resource-free binding type. Unsupported tools stay
 REQUESTED with RESOURCE_BINDING_UNVERIFIED when granted; their persisted execution
-policy is REQUIRE_APPROVAL. This milestone does not implement binding models for
-their resources. PENDING_APPROVAL has no decision or consumption path and never
-becomes READY automatically. Cancellation remains limited to the original blocked
+policy is REQUIRE_APPROVAL. Phase 11.3 supports only the separately reviewed write_demo_receipt WRITE mode,
+which has a dedicated approval/consumption path. Other sensitive requests stay
+blocked. Cancellation remains limited to the original blocked
 REQUESTED state. READY, PENDING_APPROVAL and UNKNOWN retain the active run slot.
 
 READY records an admission-time eligibility decision; it does not guarantee that
-authorization remains current. No new endpoint can set states or dispatch tools.
+authorization remains current. Eligibility inspection cannot authorize execution.
 All existing public Invocation DTOs retain `executionAllowed: false`.
 
 ## Durable evidence and policy revisions
@@ -93,19 +98,20 @@ policy. Its result always contains `startAllowed: false` and it writes no start 
 Changing bindings/grants does not refresh old snapshots. Inspection with a different
 requester credential is fail-closed, even for another credential of the same agent.
 
-For Phase 11.2b, the authenticated executor start transaction must obtain the same
-run/Invocation/policy/requester locks, load the original request credential from its
-snapshot, call this guard, validate executor identity, deployment isolation and
-installed artifact, assignment session/generation/lease and any exact unexpired
-approval, then atomically consume approval and commit START_AUTHORIZED. Lock order
-must be shared with claim/revocation paths. The boolean inspection result cannot be
-cached, sent as an offline permit or used to start after its transaction ends.
+The 11.2b protocol also calls the guard for the exact current pre-start CLAIMED
+generation. This policy check does not itself validate a lease as start permission;
+the protocol separately fences claimant identity and deadlines and never starts a
+handler. The agent-facing inspection remains READY-only.
 
-No START_AUTHORIZED commit, executor credential verification for start, assignment,
-lease, permit, durable executor ledger or approval consumption is implemented here.
-The eventual start commit will order revocation against *new authorization*, not
-against the first physical handler instruction. Already-started effects may be
-irreversible. No exactly-once or remote cancellation guarantee is made.
+Phase 11.2c reuses the guard inside the executor-only atomic start transaction,
+requiring the exact current session, claim/generation, unexpired lease and approved
+health artifact/ledger installation. It commits START_AUTHORIZED before permission
+is returned. The guard itself **still** always returns `startAllowed: false`; only
+the owning transaction may authorize this fixed READ_ONLY path. WRITE uses the separately bound external approval consumption; READ_ONLY does not
+consume an approval. See [start, ledger and result semantics](executor-protocol.md#atomic-start-and-result-api)
+for the authoritative protocol. Start commit orders revocation against new
+authorization, not the first physical handler instruction. No exactly-once or remote
+cancellation guarantee is made.
 
 ## Resource-state and remaining limitations
 

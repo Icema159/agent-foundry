@@ -10,6 +10,7 @@
     "build:dashboard": "npm run build && node scripts/build-dashboard.mjs",
     "dashboard": "npm run build:dashboard --silent && node dist/src/dashboard.js",
     "external-api": "npm run build --silent && node dist/src/external-api.js",
+    "build:executor": "npm run build --silent && node scripts/build-executor.mjs",
     "test": "npm run build && node --test dist/tests/**/*.test.js",
     "agent": "npm run build --silent && node dist/src/cli.js",
     "evals": "npm run build --silent && node dist/src/eval-cli.js list",
@@ -25,7 +26,9 @@
     "sandbox:build": "docker build -f sandbox/Dockerfile -t agent-foundry-sandbox:phase7 .",
     "prisma:generate": "prisma generate",
     "prisma:validate": "prisma validate",
-    "prisma:migrate": "prisma migrate deploy"
+    "prisma:migrate": "prisma migrate deploy",
+    "reconcile": "npm run build --silent && node dist/src/reconciliation-cli.js",
+    "external-approvals": "npm run build --silent && node dist/src/external-approval-cli.js"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",

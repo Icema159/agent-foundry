@@ -1,3 +1,4 @@
+import { WRITE_HANDLER } from "../executor/demo-receipt-contract.js";
 import { canonical } from "../registry/validation.js";
 
 export const RESOURCE_FREE_RESOURCE = "foundry:resource-free:v1";
@@ -9,6 +10,11 @@ export function isResourceFreeReadOnly(tool: { declaredProfile: string; inputSch
   return tool.declaredProfile === "READ_ONLY" &&
     canonical(tool.inputSchema).digest === canonical(RESOURCE_FREE_SCHEMA).digest &&
     canonical(args).digest === canonical({}).digest;
+}
+
+export function isDemoReceiptWrite(tool:{name:string;handlerId:string;declaredProfile:string;inputSchema:unknown},args:unknown){
+  return tool.name==="write_demo_receipt"&&tool.handlerId===WRITE_HANDLER&&tool.declaredProfile==="WRITE"&&
+    canonical(tool.inputSchema).digest===canonical(RESOURCE_FREE_SCHEMA).digest&&canonical(args).digest===canonical({}).digest;
 }
 
 export function grantDigest(grant: { id: string; ownerId: string; versionId: string; toolId: string; deploymentId: string;

@@ -1,9 +1,12 @@
+import { approvalIdentity } from "../external-approvals/approval-binding.js";
+import { ExternalApprovals } from "../external-approvals/external-approvals.js";
+import { WRITE_MODE } from "../executor/demo-receipt-contract.js";
 import { randomUUID } from "node:crypto";
-import type { Prisma, PrismaClient } from "../generated/prisma/client.js";
+import { Prisma, type PrismaClient } from "../generated/prisma/client.js";
 import { authorize, IdentityError, type AuthenticatedContext, type Scope } from "../identity/identity.js";
-import { canonical, text } from "../registry/validation.js";
+import { canonical, text, ValidationError } from "../registry/validation.js";
 import { validateArguments } from "./argument-validation.js";
-import { lockCredential } from "../authorization/credential-lock.js";
+import { databaseNow, lockCredential } from "../authorization/credential-lock.js";
 import { authorizationSnapshot, evaluateAuthorization, recheckPinnedAuthorization } from "../authorization/invocation-authorization.js";
 import { grantDigest } from "../authorization/resource-binding.js";
 
@@ -16,9 +19,17 @@ async function agent(context: AuthenticatedContext, scope: Scope): Promise<strin
   return context.agentId;
 }
 
-/** Internal control plane only. No queues, executor, approval or execution path. */
+/** External control plane only. No reference queue/runtime or physical handler execution. */
 export class InvocationService {
-  constructor(private readonly db: PrismaClient) {}
+  constructor(private readonly db: PrismaClient, private readonly approvalTtlMs = 900000) {
+    if(!Number.isSafeInteger(approvalTtlMs)||approvalTtlMs<1000||approvalTtlMs>900000)throw new ValidationError("Invalid external approval TTL");
+  }
+  async approvalStatus(context:AuthenticatedContext,id:string){
+    const agentId=await agent(context,"invocation:request");
+    const inv=await this.db.invocation.findFirst({where:{id,ownerId:context.ownerId,agentId},select:{externalApproval:{select:{id:true}}}});
+    if(!inv)throw new IdentityError();
+    return inv.externalApproval?new ExternalApprovals(this.db).agentStatus(context,id):null;
+  }
   async openRun(context: AuthenticatedContext, versionId: string) {
     const agentId = await agent(context, "run:manage"); text(versionId, "version ID");
     const version = await this.db.externalAgentVersion.findFirst({ where: { id: versionId, ownerId: context.ownerId, agentId } });
@@ -66,8 +77,15 @@ export class InvocationService {
         authorizationSnapshot(invocation, tool, deployment, grant, decision.binding, credential, decision.executionPolicy) : null;
       if (snapshot && decision.binding) await tx.invocationAuthorization.create({ data: { invocationId: invocation.id, runId,
         bindingId: decision.binding.id, credentialId: credential.id, snapshot: snapshot.value as Prisma.InputJsonValue, digest: snapshot.digest } });
+      let externalApprovalId:string|undefined;
+      if(snapshot&&decision.binding?.mode===WRITE_MODE&&status==="PENDING_APPROVAL"){
+        const now=await databaseNow(tx),expiresAt=new Date(Math.min(now.getTime()+this.approvalTtlMs,decision.binding.expiresAt.getTime(),credential.expiresAt.getTime()));
+        const identity=approvalIdentity(invocation,snapshot.value,snapshot.digest,decision.binding,expiresAt);
+        const approval=await tx.externalApprovalRequest.create({data:{invocationId:invocation.id,ownerId:context.ownerId,authorizationDigest:snapshot.digest,identity:identity.value as Prisma.InputJsonValue,digest:identity.digest,expiresAt}});
+        externalApprovalId=approval.id;
+      }
       await tx.invocationEvent.create({ data: { runId, invocationId: invocation.id, actorPrincipalId: context.principalId,
-        kind: "AUTHORIZATION_DECISION", status, reason, authorization: { requestFingerprint: fingerprint,
+        kind: "AUTHORIZATION_DECISION", status, reason, ...(externalApprovalId?{externalApprovalId}:{}), authorization: { requestFingerprint: fingerprint,
           grantId: grant?.id ?? null, policyRevision: grant?.id ?? null, grantDigest: grant ? grantDigest(grant) : null,
           bindingId: decision.binding?.id ?? null, bindingRevision: decision.binding?.revision ?? null,
           executionPolicy: decision.executionPolicy, authorizationDigest: snapshot?.digest ?? null } } });
@@ -83,6 +101,10 @@ export class InvocationService {
       if (!found) throw new IdentityError();
       const runs = await tx.$queryRaw<Array<{ status: string }>>`SELECT status FROM "ExternalRun" WHERE id = ${found.runId}
         AND "ownerId" = ${context.ownerId} AND "agentId" = ${agentId} FOR UPDATE`;
+      const approval=await tx.externalApprovalRequest.findUnique({where:{invocationId},include:{decision:true}});
+      const ids=[...new Set([context.credentialId,approval?.decision?.credentialId].filter((id):id is string=>!!id))].sort();
+      await tx.$queryRaw`SELECT id FROM "Credential" WHERE id IN (${Prisma.join(ids)}) ORDER BY id FOR UPDATE`;
+      await tx.$queryRaw`SELECT id FROM "Principal" WHERE id IN (SELECT "principalId" FROM "Credential" WHERE id IN (${Prisma.join(ids)})) ORDER BY id FOR UPDATE`;
       const { credential } = await lockCredential(tx, context, "invocation:request");
       await tx.$queryRaw`SELECT id FROM "Invocation" WHERE id = ${invocationId} FOR UPDATE`;
       const invocation = await tx.invocation.findUniqueOrThrow({ where: { id: invocationId } });

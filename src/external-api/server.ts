@@ -1,49 +1,13 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer } from "node:http";
 import { CredentialAuthenticator, IdentityError, requireScope, type Scope } from "../identity/identity.js";
 import { InvocationConflict, InvocationService } from "../invocation/invocation-service.js";
 import { ValidationError } from "../registry/validation.js";
+import { HttpError, bad, id, bodyObject, jsonBody, send } from "./http.js";
+import { ExecutorProtocol, ExecutorConflict } from "../executor/executor-protocol.js";
+import { handleExecutorRequest } from "../executor/http.js";
+import { ExecutorExecution } from "../executor/execution-service.js";
+import { safeReportedResult } from "../executor/execution-contract.js";
 
-const MAX_BODY_BYTES = 65536;
-const MAX_RESPONSE_BYTES = 131072;
-class HttpError extends Error { constructor(readonly status: number, readonly code: string, message: string) { super(message); } }
-const bad = () => new HttpError(400, "INVALID_REQUEST", "Invalid request");
-function id(value: unknown): string {
-  if (typeof value !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(value)) throw bad();
-  return value;
-}
-function bodyObject(value: unknown, allowed: string[], required: string[]): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw bad();
-  const obj = value as Record<string, unknown>, keys = Object.keys(obj);
-  if (keys.some(k => !allowed.includes(k)) || required.some(k => !Object.hasOwn(obj, k))) throw bad();
-  return obj;
-}
-async function jsonBody(req: IncomingMessage): Promise<unknown> {
-  if (!/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(req.headers["content-type"] ?? "")) throw new HttpError(415, "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json");
-  if (req.headers["content-encoding"] && req.headers["content-encoding"] !== "identity") throw new HttpError(415, "UNSUPPORTED_MEDIA_TYPE", "Content encoding is not supported");
-  const declared = req.headers["content-length"];
-  if (declared && (!/^\d+$/.test(declared) || Number(declared) > MAX_BODY_BYTES)) { req.resume(); throw new HttpError(413, "PAYLOAD_TOO_LARGE", "Request body is too large"); }
-  return new Promise((resolve, reject) => {
-    let size = 0, failed = false; const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => {
-      if (failed) return;
-      size += chunk.length;
-      if (size > MAX_BODY_BYTES) { failed = true; chunks.length = 0; reject(new HttpError(413, "PAYLOAD_TOO_LARGE", "Request body is too large")); return; }
-      chunks.push(chunk);
-    });
-    req.on("end", () => {
-      if (failed) return;
-      try { resolve(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks))) as unknown); } catch { reject(bad()); }
-    });
-    req.on("aborted", () => { if (!failed) { failed = true; reject(bad()); } });
-    req.on("error", () => { if (!failed) { failed = true; reject(bad()); } });
-  });
-}
-function send(res: ServerResponse, status: number, value: unknown): void {
-  let json = JSON.stringify(value);
-  if (Buffer.byteLength(json) > MAX_RESPONSE_BYTES) { status = 503; json = JSON.stringify({ error: { code: "RESPONSE_LIMIT", message: "Response exceeds the configured limit" } }); }
-  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
-  res.end(json);
-}
 function runDto(run: { id: string; versionId: string; status: string; createdAt: Date; completedAt: Date | null }) {
   return { id: run.id, versionId: run.versionId, status: run.status, createdAt: run.createdAt.toISOString(), completedAt: run.completedAt?.toISOString() ?? null };
 }
@@ -51,8 +15,14 @@ function invocationDto(inv: { id: string; runId: string; versionId: string; tool
   return { id: inv.id, runId: inv.runId, versionId: inv.versionId, toolId: inv.toolId, deploymentId: inv.deploymentId, grantId: inv.grantId,
     status: inv.status, reason: inv.reason, executionAllowed: false, createdAt: inv.createdAt.toISOString(), updatedAt: inv.updatedAt.toISOString() };
 }
-function eventDto(event: { sequence: bigint; invocationId: string; kind: string; status: string; reason: string; createdAt: Date }) {
-  return { cursor: event.sequence.toString(), invocationId: event.invocationId, kind: event.kind, status: event.status, reason: event.reason, createdAt: event.createdAt.toISOString() };
+function eventDto(event: { sequence: bigint; invocationId: string; kind: string; status: string; reason: string; createdAt: Date;
+  claimId?: string | null; claimGeneration?: number | null; leaseExpiresAt?: Date | null; startId?: string | null; reportId?: string | null; executionResult?: unknown; findingId?: string | null; externalApprovalId?: string | null }) {
+  return { cursor: event.sequence.toString(), invocationId: event.invocationId, kind: event.kind, status: event.status, reason: event.reason, createdAt: event.createdAt.toISOString(),
+    ...(event.claimId && event.claimGeneration && event.leaseExpiresAt ? { claim: { id: event.claimId, generation: event.claimGeneration, leaseExpiresAt: event.leaseExpiresAt.toISOString() } } : {}),
+    ...(event.externalApprovalId ? {approval:{id:event.externalApprovalId}} : {}),
+    ...(event.findingId ? { finding: { id: event.findingId, verification: "OPERATOR_FINDING_NOT_VERIFIED" } } : {}),
+    ...(event.startId ? { execution: { startId: event.startId, ...(event.reportId ? { reportId: event.reportId, verification: "EXECUTOR_REPORTED" } : {}),
+      ...(event.status === "SUCCEEDED" && safeReportedResult(event.executionResult,event.invocationId) ? { result: safeReportedResult(event.executionResult,event.invocationId) } : {}) } } : {}) };
 }
 function conflict(error: InvocationConflict): HttpError {
   const known: Record<string, [string, string]> = {
@@ -67,7 +37,11 @@ function conflict(error: InvocationConflict): HttpError {
 }
 
 /** A separate API; listen only on loopback or behind a trusted TLS terminator. */
-export function createExternalApiServer(services: { auth: CredentialAuthenticator; invocations: InvocationService }) {
+export function createExternalApiServer(services: { auth: CredentialAuthenticator; invocations: InvocationService; executors?: ExecutorProtocol; execution?: ExecutorExecution }) {
+  async function withApproval(context:import("../identity/identity.js").AuthenticatedContext,inv:Parameters<typeof invocationDto>[0]){
+    const approval=await services.invocations.approvalStatus(context,inv.id);
+    return {...invocationDto(inv),...(approval?{approval}: {})};
+  }
   const server = createServer(async (req, res) => {
     try {
       const headers = req.rawHeaders.filter((_, i) => i % 2 === 0 && req.rawHeaders[i]!.toLowerCase() === "authorization");
@@ -76,8 +50,13 @@ export function createExternalApiServer(services: { auth: CredentialAuthenticato
       let context;
       try { context = await services.auth.authenticate(token); }
       catch (error) { if (error instanceof IdentityError) throw new HttpError(401, "UNAUTHENTICATED", "Authentication required"); throw error; }
-      if (context.principalType !== "AGENT") throw new HttpError(403, "FORBIDDEN", "Access denied");
       const url = new URL(req.url ?? "/", "http://localhost"), path = url.pathname;
+      if (path.startsWith("/api/v1/executor/")) {
+        if (context.principalType !== "EXECUTOR") throw new HttpError(403, "FORBIDDEN", "Access denied");
+        if (!services.executors) throw new HttpError(404, "NOT_FOUND", "Resource not found");
+        return await handleExecutorRequest(req, res, url, context, services.executors, services.execution);
+      }
+      if (context.principalType !== "AGENT") throw new HttpError(403, "FORBIDDEN", "Access denied");
       const pathRun = /^\/api\/v1\/external\/runs\/([^/]+)$/.exec(path);
       const pathInvocations = /^\/api\/v1\/external\/runs\/([^/]+)\/invocations$/.exec(path);
       const pathHistory = /^\/api\/v1\/external\/runs\/([^/]+)\/history$/.exec(path);
@@ -102,9 +81,9 @@ export function createExternalApiServer(services: { auth: CredentialAuthenticato
         if (typeof body.idempotencyKey !== "string" || !body.idempotencyKey.trim() || body.idempotencyKey.length > 128) throw bad();
         const invocation = await services.invocations.acceptInvocation(context, { runId, idempotencyKey: body.idempotencyKey,
           toolId: id(body.toolId), deploymentId: id(body.deploymentId), ...(body.grantId !== undefined ? { grantId: id(body.grantId) } : {}), arguments: body.arguments });
-        return send(res, 200, { invocation: invocationDto(invocation) });
+        return send(res, 200, { invocation: await withApproval(context,invocation) });
       }
-      if (pathInvocation) return send(res, 200, { invocation: invocationDto(await services.invocations.getInvocation(context, id(pathInvocation[1]))) });
+      if (pathInvocation) return send(res,200,{invocation:await withApproval(context,await services.invocations.getInvocation(context,id(pathInvocation[1])))});
       if (pathCancel) {
         bodyObject(await jsonBody(req), [], []);
         const invocation = await services.invocations.getInvocation(context, id(pathCancel[1]));
@@ -125,6 +104,7 @@ export function createExternalApiServer(services: { auth: CredentialAuthenticato
     } catch (error) {
       const failure = error instanceof HttpError ? error : error instanceof IdentityError ? new HttpError(404, "NOT_FOUND", "Resource not found") :
         error instanceof ValidationError ? bad() : error instanceof InvocationConflict ? conflict(error) :
+        error instanceof ExecutorConflict ? new HttpError(409, error.code, "Executor request conflicts with current state") :
         new HttpError(503, "SERVICE_UNAVAILABLE", "Service unavailable");
       if (failure.status === 401) res.setHeader("WWW-Authenticate", "Bearer");
       if (!res.headersSent) send(res, failure.status, { error: { code: failure.code, message: failure.message } });
