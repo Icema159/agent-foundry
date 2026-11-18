@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
+import { Client } from "pg";
 import { createPrismaClient, PrismaExecutionStore } from "../src/persistence/prisma-execution-store.js";
 import { PrismaIdentityStore } from "../src/identity/prisma-identity-store.js";
 import { AgentRegistry } from "../src/identity/agent-registry.js";
@@ -11,7 +13,7 @@ import { ValidationError } from "../src/registry/validation.js";
 import { recoverStaleRuns } from "../src/recovery/recover-stale-runs.js";
 
 const url = process.env.FOUNDRY_11C_TEST_DATABASE_URL;
-test("isolated PostgreSQL: invocation admission, isolation, history and races", { skip: !url }, async () => {
+test("isolated PostgreSQL: invocation admission, isolation, history and races", { skip: !url }, async t => {
   const parsed = new URL(url!);
   if (!["127.0.0.1", "localhost", "::1"].includes(parsed.hostname) || !/^\/foundry_11c_test_[a-z0-9]+$/.test(parsed.pathname)) throw new Error("Dedicated local foundry_11c_test_* database required");
   const db = createPrismaClient(url!);
@@ -55,6 +57,119 @@ test("isolated PostgreSQL: invocation admission, isolation, history and races", 
     assert.equal(new Set(receipt.map(x => x.id)).size, 1);
     const invocation = receipt[0]!; assert.equal(invocation.status, "REQUESTED"); assert.equal(invocation.reason, "RESOURCE_BINDING_UNVERIFIED");
     assert.equal(await db.invocationEvent.count({ where: { runId: run.id } }), 1);
+    for (const unauthorized of [otherCtx, siblingCtx]) {
+      await assert.rejects(service.cancelBlocked(unauthorized, run.id, invocation.id), IdentityError);
+      await assert.rejects(service.closeRun(unauthorized, run.id), IdentityError);
+    }
+    assert.equal(await db.invocationEvent.count({ where: { runId: run.id } }), 1);
+
+    function taggedConnection(application: string) {
+      const connection = new URL(url!);
+      connection.searchParams.set("application_name", application);
+      return createPrismaClient(connection.href);
+    }
+    async function waitForLock(application: string, table: string) {
+      for (let n = 0; n < 200; n++) {
+        const [row] = await db.$queryRaw<Array<{ waiting: boolean }>>`
+          SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name = ${application}
+            AND wait_event_type = 'Lock' AND query LIKE ${`%"${table}"%`}) AS waiting`;
+        if (row?.waiting) return;
+        await delay(10);
+      }
+      throw new Error(`Expected ${table} lock wait was not observed`);
+    }
+
+    for (const operation of ["cancel", "close"] as const) {
+      for (const invalidation of ["revocation", "expiration"] as const) {
+        await t.test(`${operation} rejects ${invalidation} while waiting on the run lock`, async () => {
+          const pendingRun = await service.openRun(ctx, version.id);
+          const blocked = operation === "cancel"
+            ? await service.acceptInvocation(ctx, { ...base, runId: pendingRun.id, idempotencyKey: "blocked" })
+            : undefined;
+          const credential = await issuer.issue({ principalId: p.id, scopes: ["run:manage", "invocation:request"], expiresAt: expiry });
+          const caller = await auth.authenticate(credential.secret);
+          const application = `r3-${operation}-${invalidation}`;
+          const competingDb = taggedConnection(application), competingService = new InvocationService(competingDb);
+          const holder = new Client({ connectionString: url! });
+          await holder.connect();
+          let result: Promise<unknown> | undefined;
+          try {
+            await holder.query("BEGIN");
+            await holder.query('SELECT id FROM "ExternalRun" WHERE id=$1 FOR UPDATE', [pendingRun.id]);
+            const mutation = blocked
+              ? competingService.cancelBlocked(caller, pendingRun.id, blocked.id)
+              : competingService.closeRun(caller, pendingRun.id);
+            result = mutation.then(() => null, (error: unknown) => error);
+            await waitForLock(application, "ExternalRun");
+            if (invalidation === "revocation") {
+              await admin.revokeCredential(credential.credentialId);
+            } else {
+              // Move the fixture deadline forward briefly, then let database wall time pass it.
+              await db.$executeRaw`UPDATE "Credential" SET "expiresAt" = (clock_timestamp() AT TIME ZONE 'UTC') + interval '100 milliseconds'
+                WHERE id = ${credential.credentialId}`;
+              await holder.query("SELECT pg_sleep(0.15)");
+            }
+            await holder.query("COMMIT");
+            assert.ok(await result instanceof IdentityError, "stale credential must reject the mutation");
+            assert.deepEqual(await db.externalRun.findUniqueOrThrow({ where: { id: pendingRun.id } }), pendingRun);
+            if (blocked) assert.deepEqual(await db.invocation.findUniqueOrThrow({ where: { id: blocked.id } }), blocked);
+            assert.equal(await db.invocationEvent.count({ where: { runId: pendingRun.id } }), blocked ? 1 : 0);
+          } finally {
+            await holder.query("ROLLBACK");
+            await result;
+            await holder.end();
+            await competingDb.$disconnect();
+          }
+        });
+      }
+    }
+
+    await t.test("revocation waits for a cancellation that already locked its credential", async () => {
+      const pendingRun = await service.openRun(ctx, version.id);
+      const blocked = await service.acceptInvocation(ctx, { ...base, runId: pendingRun.id, idempotencyKey: "blocked" });
+      const credential = await issuer.issue({ principalId: p.id, scopes: ["invocation:request"], expiresAt: expiry });
+      const caller = await auth.authenticate(credential.secret);
+      const cancelDb = taggedConnection("r3-cancel-first"), revokeDb = taggedConnection("r3-revoke-second");
+      const holder = new Client({ connectionString: url! });
+      await holder.connect();
+      const pending: Promise<unknown>[] = [];
+      try {
+        await holder.query("BEGIN");
+        await holder.query('SELECT id FROM "Invocation" WHERE id=$1 FOR UPDATE', [blocked.id]);
+        const cancellation = new InvocationService(cancelDb).cancelBlocked(caller, pendingRun.id, blocked.id);
+        pending.push(cancellation);
+        await waitForLock("r3-cancel-first", "Invocation");
+        const revocation = new TrustedIdentityAdministration(new PrismaIdentityStore(revokeDb)).revokeCredential(credential.credentialId);
+        pending.push(revocation);
+        await waitForLock("r3-revoke-second", "Credential");
+        await holder.query("COMMIT");
+        assert.equal((await cancellation).status, "REVOKED");
+        await revocation;
+        await assert.rejects(auth.authenticate(credential.secret), IdentityError);
+        assert.deepEqual((await service.history(ctx, pendingRun.id)).map(e => e.kind), ["AUTHORIZATION_DECISION", "CANCELLED"]);
+      } finally {
+        await holder.query("ROLLBACK");
+        await Promise.allSettled(pending);
+        await holder.end();
+        await cancelDb.$disconnect();
+        await revokeDb.$disconnect();
+      }
+    });
+
+    await t.test("concurrent cancellation and closure obey the blocked-run invariant", async () => {
+      const pendingRun = await service.openRun(ctx, version.id);
+      const blocked = await service.acceptInvocation(ctx, { ...base, runId: pendingRun.id, idempotencyKey: "blocked" });
+      const [closed, cancelled] = await Promise.allSettled([
+        service.closeRun(ctx, pendingRun.id),
+        service.cancelBlocked(ctx, pendingRun.id, blocked.id),
+      ]);
+      assert.equal(cancelled.status, "fulfilled");
+      if (closed.status === "rejected") assert.ok(closed.reason instanceof InvocationConflict);
+      const completed = await service.closeRun(ctx, pendingRun.id);
+      assert.equal(completed.status, "COMPLETED");
+      assert.deepEqual(await service.closeRun(ctx, pendingRun.id), completed);
+      assert.deepEqual((await service.history(ctx, pendingRun.id)).map(e => e.status), ["REQUESTED", "REVOKED"]);
+    });
     const rollbackRun = await service.openRun(ctx, version.id);
     await db.$executeRawUnsafe(`CREATE FUNCTION test_reject_event() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected event failure'; END; $$`);
     try {
@@ -133,7 +248,14 @@ test("isolated PostgreSQL: invocation admission, isolation, history and races", 
     const stale = await referenceStore.findStaleExecutions(new Date(Date.now() + 60000));
     assert.equal(stale.some(item => item.taskRunId === unknownRun.id), false);
     assert.ok(stale.some(item => item.taskRunId === pending.taskRunId));
-    const recovered = await recoverStaleRuns({ store: referenceStore, queue: { async enqueue() { return { jobId: "test" }; }, async close() {} }, now: new Date(), leaseTimeoutMs: 1000, maxRecoveries: 1 });
+    const recovered = await recoverStaleRuns({ store: referenceStore, queue: {
+      async enqueue(taskRunId, deliveryId) {
+        assert.equal(taskRunId, pending.taskRunId);
+        assert.ok(deliveryId);
+        return { jobId: deliveryId };
+      },
+      async close() {},
+    }, now: new Date(), leaseTimeoutMs: 1000, maxRecoveries: 1 });
     assert.equal(recovered.requeued, 1);
     assert.equal((await db.externalRun.findUniqueOrThrow({ where: { id: unknownRun.id } })).status, "RUNNING");
   } finally { await db.$disconnect(); }

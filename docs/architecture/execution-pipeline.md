@@ -64,8 +64,45 @@ complete configuration-conflict validation exists.
 [`BullTaskRunQueue`](../../src/queue/agent-task-queue.ts) sends only `{ taskRunId }`
 to `agent-task-execution`, with job `attempts: 1`. Redis is transport so workers
 reload authoritative state rather than trusting duplicated queue configuration.
-Database writes and enqueue are **not atomic**: an enqueue failure can leave a
-PENDING run. There is no transactional outbox or automatic pending-run repair.
+
+### Reference delivery diagnostics and repair
+
+Each new PENDING transition (submission, approval continuation, read-only
+recovery) persists a `TaskRunDelivery` in the same transaction. Its unique ID
+is the BullMQ job ID for that transition. A retained job with the same ID is
+deduplicated by BullMQ. The worker requires that ID on the PENDING-to-RUNNING
+update and records the claim time on the delivery in the same transaction.
+Old jobs cannot claim a newer transition. Legacy numeric job IDs only claim
+runs whose current delivery is untracked.
+
+Each producer records an attempt before sending. `NOT_SENT` means the queue
+was unavailable before the add call. `ACK_UNKNOWN` means a matching response
+was not observed after attempting the add. `CONFIRMED` means Redis acknowledged
+the job ID, and `UNCONFIRMED` covers interruptions and unwritten outcomes.
+Those facts describe transport, not execution. A missing job does not prove an
+earlier job never ran. Diagnostics keep current queue state separate from the
+durable lifecycle and attempt outcomes.
+
+The local operator CLI uses the existing shell and database trust boundary
+and scopes its queries to the local reference owner. Use `npm run delivery -- list`
+for up to 25 tracked PENDING deliveries older than 30 seconds. This list is
+age-based and can include queued jobs. Use `npm run delivery -- inspect TASK_RUN_ID`
+for current lifecycle, queue evidence and the last ten attempts.
+
+`npm run delivery -- reconcile TASK_RUN_ID` requires a missing job and a stale
+PENDING delivery. It locks the TaskRun row shared with worker claiming, rechecks
+the exact current delivery and execution evidence, and records the local actor
+and attempt before releasing the lock. Redis I/O runs outside that transaction.
+The same job ID, conditional claim and a 30-second repeat-attempt guard handle
+overlapping sends. Reconciliation covers a proven never-claimed submission
+and already-authorized strictly read-only recovery. It leaves untracked runs,
+approval continuations and any ambiguous or claimed generation for investigation.
+Existing, delayed, active and terminal Redis jobs are preserved. The command
+never assigns an execution outcome.
+
+PostgreSQL and Redis remain separate commits. A process can stop before enqueue,
+or after Redis accepts a job but before PostgreSQL records the acknowledgement.
+An automatic dispatcher with a transactional outbox would be a separate feature.
 
 ## 3. Worker, lease and runtime ownership
 
@@ -118,6 +155,22 @@ not an assumption of safety. The current CLI allows reads and requires approval
 for creation/deletion; reasoning instructions live separately in
 [`repository-explorer.ts`](../../src/agents/repository-explorer.ts).
 
+The three read tools share a path visibility policy. It hides known credential
+locations and names (including all `.env.*` files, private-key formats, and
+package-manager auth files) alongside Git internals and generated directories.
+It checks the normalized path and its resolved target, rejects symlinks and
+hard-linked files, and reports unavailable paths without OS error details.
+File reads use a verified regular-file descriptor, opened without following the
+final component. Before and after scanning, Foundry compares the descriptor with
+the visible path and checks identity, link count, size and change timestamps.
+Detected replacements or modifications discard the result. This relies on a
+trusted workspace filesystem; the portable Node path checks are not an atomic
+directory-relative path walk against a hostile local writer.
+This is a path-based filter. Secrets under ordinary filenames or embedded in
+source can still be returned. Use a workspace without secrets and keep it under
+trusted local control. File descriptor checks narrow path races but do not turn
+the host read process into filesystem isolation.
+
 ## 5. Approval suspension is not recovery
 
 For REQUIRE_APPROVAL, the runtime returns the validated proposal and messages
@@ -169,9 +222,19 @@ after approval can use changed environment settings.
 
 [`ToolResultLimiter`](../../src/runtime/tool-result-limiter.ts) centrally limits
 model-visible results, including approved resumes. Small results are unchanged;
-oversized reads yield structured TOOL_RESULT_TOO_LARGE feedback requesting a
-smaller portion, not silently truncated content. `read_file` supports optional
-1-based `startLine` / `maxLines`, but still reads the file into memory first.
+results over the runtime budget yield structured TOOL_RESULT_TOO_LARGE feedback.
+`read_file` uses 16 KiB chunks, scans at most 8 MiB from the beginning of the
+file, and collects whole lines up to 64 KiB of JSON-encoded content before
+the runtime checks the final response. It preserves UTF-8 and line endings.
+Scanned NUL bytes and invalid UTF-8 are rejected. A bounded range in a file
+larger than 256 KiB stops once the range is obtained. `totalLines` is present
+for ranged or truncated results only when EOF was reached, and `complete`
+describes the entire file. `truncationReason` distinguishes `OUTPUT_LIMIT`
+from `SCAN_LIMIT`. A line that cannot fit is omitted whole; later lines can
+still be requested by number if they fall inside the scan limit.
+`search_files` uses the same scanner and bounds encoded matches to 64 KiB.
+It signals `complete: false` when the limits omit potential matches. It
+skips unsupported text and can still scan multiple files in one call.
 Oversized write/unknown-tool output yields TOOL_RESULT_OUTPUT_OMITTED, not an
 execution failure or instruction to retry. Actual results remain durable evidence
 with size-only `outputLimit` diagnostics; storage size/redaction is not addressed.
@@ -286,10 +349,9 @@ PENDING runs are not stale-scan candidates, approved unconsumed actions resume
 normally, consumed approvals stay unavailable, and new sensitive calls still
 require their own approval. R3 correction is separate and unchanged.
 
-Database transitions and enqueue remain non-atomic. If recovery delivery throws,
-the error propagates to the recovery caller without overwriting PENDING or a
-newly claimed execution. If no job was delivered, a PENDING run may require manual
-delivery reconciliation; this phase does not add an outbox or delivery retry.
+If recovery delivery throws, the error propagates without overwriting PENDING
+or a newly claimed execution. Delivery evidence and the operator-controlled
+same-job retry are described in [reference delivery diagnostics](#reference-delivery-diagnostics-and-repair).
 
 The system has no exactly-once side-effect guarantee, generic write idempotency,
 step checkpoints, transactional enqueue, automatic provider fallback, model-call
@@ -383,7 +445,12 @@ unique per owner/run and fingerprinted with tool, deployment, requested grant an
 canonical arguments; the run pins agent/version. A same-key replay returns its
 original receipt before closure/grant/single-active checks, after fresh identity
 verification; changed payload conflicts. PostgreSQL run row locks serialize
-admission, cancellation and closure. A partial unique index enforces one active
+admission, cancellation and closure. Cancellation and closure lock the scoped run
+first, then lock the caller's Credential and Principal and recheck current identity,
+scope, revocation and expiry using database time before any state change. Revocation
+updates the same credential row and therefore cannot interleave after successful
+revalidation and before commit. Expiry is evaluated at revalidation time.
+A partial unique index enforces one active
 invocation across REQUESTED, READY, PENDING_APPROVAL, CLAIMED, START_AUTHORIZED,
 RUNNING and UNKNOWN. Events and state commit together; a DB sequence orders events
 within a locked run, with gaps possible.

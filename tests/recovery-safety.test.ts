@@ -29,6 +29,7 @@ const old = new Date("2026-10-23T09:58:00Z");
 type Row = {
   id: string; taskId: string; status: string; workerId: string | null;
   heartbeatAt: Date | null; recoveryCount: number;
+  deliveryId?: string;
   failureReason?: string; failureMessage?: string; completedAt?: Date;
 };
 
@@ -42,6 +43,7 @@ function persistenceFixture(policies: ToolPolicies = { ...reads, create_file: "R
   let beforeUpdate: ((row: Row) => void) | undefined;
   let taskWrites = 0;
   let taskStatus = "RUNNING";
+  let deliveryOutcome: string | undefined;
   const transaction = {
     taskRun: {
       async findMany() {
@@ -64,6 +66,21 @@ function persistenceFixture(policies: ToolPolicies = { ...reads, create_file: "R
         return { count: 1 };
       },
     },
+    taskRunDelivery: {
+      async create({ data }: { data: { id: string; taskRunId: string; source: string } }) {
+        assert.deepEqual(data, { id: row.deliveryId, taskRunId: row.id, source: "RECOVERY" });
+      },
+    },
+    taskRunDeliveryAttempt: {
+      async create({ data }: { data: { deliveryId: string; actor: string; manual: boolean } }) {
+        assert.deepEqual(data, { deliveryId: row.deliveryId, actor: "RECOVERY", manual: false });
+        return { id: "delivery-attempt" };
+      },
+      async update({ where, data }: { where: { id: string }; data: { outcome: string } }) {
+        assert.equal(where.id, "delivery-attempt");
+        deliveryOutcome = data.outcome;
+      },
+    },
     task: { async update({ data }: { data: { status: string } }) { taskWrites++; taskStatus = data.status; } },
     step: {
       async findFirst() { return steps.at(-1); },
@@ -75,6 +92,7 @@ function persistenceFixture(policies: ToolPolicies = { ...reads, create_file: "R
   const prisma = { ...transaction, async $transaction<T>(callback: (tx: typeof transaction) => Promise<T>) { return callback(transaction); } };
   const store = new PrismaExecutionStore(prisma as unknown as ConstructorParameters<typeof PrismaExecutionStore>[0]);
   return { row, steps, initialEvidence, store, taskWrites: () => taskWrites, taskStatus: () => taskStatus,
+    deliveryOutcome: () => deliveryOutcome,
     race: (hook: (row: Row) => void) => { beforeUpdate = hook; } };
 }
 
@@ -170,11 +188,12 @@ test("failed recovery delivery does not overwrite a newly claimed execution", as
       f.row.status = "RUNNING"; f.row.workerId = "new-worker"; f.row.heartbeatAt = new Date();
       throw new Error("Delivery outcome unknown");
     }, async close() {} },
-    now: new Date(cutoff.getTime() + 30000), leaseTimeoutMs: 30000, maxRecoveries: 2 }), /Delivery outcome unknown/);
+    now: new Date(cutoff.getTime() + 30000), leaseTimeoutMs: 30000, maxRecoveries: 2 }), /ACK_UNKNOWN/);
   assert.equal(f.row.status, "RUNNING");
   assert.equal(f.row.workerId, "new-worker");
   assert.equal(f.steps.length, 2);
   assert.equal(f.row.failureReason, null);
+  assert.equal(f.deliveryOutcome(), "ACK_UNKNOWN");
 });
 
 test("only one concurrent unsafe terminalization records a failure Step", async () => {

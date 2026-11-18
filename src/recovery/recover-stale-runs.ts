@@ -1,3 +1,4 @@
+import { deliverTaskRun } from "../queue/task-delivery.js";
 import type { ExecutionStore, StaleExecution } from "../persistence/execution-store.js";
 import type { TaskRunQueue } from "../queue/agent-task-queue.js";
 
@@ -51,7 +52,7 @@ export async function recoverStaleRuns(options: {
     if (decision.action === "REQUEUE") {
       // DB and delivery are not atomic. On enqueue errors, propagate the error
       // without overwriting PENDING or a run already claimed by another worker.
-      await options.queue.enqueue(run.taskRunId);
+      await deliverTaskRun(options.store, options.queue, { taskRunId: run.taskRunId, deliveryId: decision.deliveryId }, "RECOVERY");
       summary.requeued += 1;
     } else if (decision.action === "FAILED_LIMIT") {
       summary.failedLimit += 1;

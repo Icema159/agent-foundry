@@ -7,6 +7,10 @@ export type Attempt = { claimId: string; invocationId: string; generation: numbe
   state: "PREPARED" | "START_REQUESTED" | "START_INTENT" | "RESULT_PENDING" | "ACKED" | "AMBIGUOUS" | "ABANDONED";
   startId: string | null; report: string | null; ack: string | null };
 
+export const RECOVERY_HISTORY_LIMIT = 10_000;
+export const RECOVERY_HISTORY_WARNING_AT = 9_000;
+export type LedgerCounts = { total: number; acknowledged: number; abandoned: number; unresolved: number };
+
 function configure(db: DatabaseSync) {
   db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;");
   if ((db.prepare("PRAGMA synchronous").get() as any).synchronous !== 2) throw new Error("Durable SQLite mode unavailable");
@@ -47,9 +51,16 @@ export class StartLedger {
   }
   close() { this.db.close(); }
   get(claimId: string): Attempt { return this.db.prepare("SELECT * FROM attempts WHERE claimId=?").get(claimId) as unknown as Attempt; }
+  counts(): LedgerCounts {
+    return this.db.prepare(`SELECT COUNT(*) AS total,
+      COUNT(CASE WHEN state = 'ACKED' THEN 1 END) AS acknowledged,
+      COUNT(CASE WHEN state = 'ABANDONED' THEN 1 END) AS abandoned,
+      COUNT(CASE WHEN state NOT IN ('ACKED', 'ABANDONED') THEN 1 END) AS unresolved
+      FROM attempts`).get() as unknown as LedgerCounts;
+  }
   all(): Attempt[] {
-    const rows = this.db.prepare("SELECT * FROM attempts ORDER BY rowid LIMIT 10001").all() as unknown as Attempt[];
-    if (rows.length > 10000) throw new Error("Ledger reconciliation capacity exceeded");
+    const rows = this.db.prepare("SELECT * FROM attempts ORDER BY rowid LIMIT ?").all(RECOVERY_HISTORY_LIMIT + 1) as unknown as Attempt[];
+    if (rows.length > RECOVERY_HISTORY_LIMIT) throw new Error("Ledger reconciliation capacity exceeded");
     return rows;
   }
   unfinished(): Attempt[] { return this.db.prepare("SELECT * FROM attempts WHERE state NOT IN ('ACKED','ABANDONED') ORDER BY rowid").all() as unknown as Attempt[]; }

@@ -118,8 +118,33 @@ No software can detect an identical historical snapshot when neither side has an
 new observable evidence. Restoring/losing both PostgreSQL and ledger to matching old
 states, malicious host tampering, physical power loss and storage fsync failures are
 not covered guarantees. Retention must preserve anchor, starts, reports and local
-ACKED rows; do not prune them independently. Recovery is capped at 10,000 local/server
-claim records per installation; capacity overflow fails closed pending operator work.
+ACKED rows; retain the entire local ledger and the corresponding server history.
+
+### Recovery capacity
+
+Startup reconciles up to **10,000 records in each history**. Local history counts
+every SQLite attempt, including acknowledged (`ACKED`), abandoned (`ABANDONED`),
+and unresolved attempts. Server history counts every claim for the authenticated
+binding, including claims with no start. Starts and reports belong to their claim
+and do not count as additional records. Exactly 10,000 records can reconcile.
+Above 10,000, startup blocks recovery and polling.
+
+Use `docker logs <executor-container>` and look for `executor_recovery_capacity`.
+The startup log includes the local total and its three categories. The server
+total follows inventory traversal. If the server limit is exceeded, the count
+covers claims received through the overflow page and `inventoryComplete` is false.
+Both histories warn from **9,000**. A running executor also logs the local count
+when inserts reach 9,000, 10,000, or 10,001. The limit applies to recovery, so a
+running installation can outgrow the amount it can reconcile on restart. Server
+history can reach its limit independently of local counts.
+
+Preserve the ledger and server history at capacity and plan a reviewed replacement
+for genuinely new work. A future checkpoint design would need an authenticated
+boundary agreed by both stores, tied to the original installation anchor and
+verifiable against retained history. It must account for all covered claims,
+starts, reports, and ACKs, preserve all unresolved evidence and late-report
+handling, and reject stale or substituted checkpoints. No checkpoint mechanism
+or history cleanup is provided here.
 
 Apply migration `20261111000000_executor_reconciliation` explicitly to the intended
 DB before upgraded API/runtime code. It adds immutable ExecutorLedgerAnchor,

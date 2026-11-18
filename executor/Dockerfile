@@ -8,8 +8,9 @@ ENTRYPOINT ["node", "/app/main.mjs"]
 
 FROM node:22-alpine AS private-api
 WORKDIR /app
-COPY package.json ./package.json
-COPY node_modules ./node_modules
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund --cache /tmp/foundry-npm-cache \
+    && rm -rf /tmp/foundry-npm-cache
 COPY dist/src ./dist/src
 # Root-owned code remains immutable to UID10001; launch also requires --read-only.
 USER 10001:10001

@@ -118,6 +118,7 @@ export class InvocationService {
     return this.db.$transaction(async tx => {
       const runs = await tx.$queryRaw<Array<{ id: string; status: string }>>`SELECT id, status FROM "ExternalRun" WHERE id = ${runId} AND "ownerId" = ${context.ownerId} AND "agentId" = ${agentId} FOR UPDATE`;
       if (!runs[0]) throw new IdentityError();
+      await lockCredential(tx, context, "invocation:request");
       if (runs[0].status !== "RUNNING") throw new InvocationConflict("External run is closed");
       const updated = await tx.invocation.updateMany({ where: { id: invocationId, runId, ownerId: context.ownerId, status: "REQUESTED", reason: "RESOURCE_BINDING_UNVERIFIED" },
         data: { status: "REVOKED", reason: "AGENT_CANCELLED" } });
@@ -132,6 +133,7 @@ export class InvocationService {
     return this.db.$transaction(async tx => {
       const runs = await tx.$queryRaw<Array<{ id: string; status: string }>>`SELECT id, status FROM "ExternalRun" WHERE id = ${runId} AND "ownerId" = ${context.ownerId} AND "agentId" = ${agentId} FOR UPDATE`;
       if (!runs[0]) throw new IdentityError();
+      await lockCredential(tx, context, "run:manage");
       if (runs[0].status === "COMPLETED") return tx.externalRun.findUniqueOrThrow({ where: { id: runId } });
       if (await tx.invocation.findFirst({ where: { runId, status: { in: [...active] } }, select: { id: true } })) throw new InvocationConflict("External run has an unresolved invocation");
       return tx.externalRun.update({ where: { id: runId }, data: { status: "COMPLETED", completedAt: new Date() } });

@@ -10,7 +10,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { Client } from "pg";
 import { startFixture } from "./executor-start-fixture.js";
 import { ExecutorExecution } from "../src/executor/execution-service.js";
-import { HEALTH_RESULT } from "../src/executor/execution-contract.js";
+import { EXECUTION_PROFILE, HEALTH_RESULT } from "../src/executor/execution-contract.js";
 import { createExternalApiServer } from "../src/external-api/server.js";
 import { HttpExecutorClient } from "../src/executor-runtime/api-client.js";
 import { initializeLedger, StartLedger } from "../src/executor-runtime/ledger.js";
@@ -24,6 +24,31 @@ test("isolated PostgreSQL: durable isolated start and report protocol", { skip: 
   if (!["127.0.0.1","localhost","::1"].includes(parsed.hostname) || !/^\/foundry_112c_test_[a-z0-9]+$/.test(parsed.pathname)) throw new Error("Dedicated 112c database required");
   async function fixture() { const f = await startFixture(url!); t.after(() => f.db.$disconnect()); return f; }
   const success = (input: { sessionId: string; generation: number }) => ({ sessionId: input.sessionId, generation: input.generation, outcome: "SUCCEEDED" as const, reason: "HEALTH_PING_RETURNED", result: HEALTH_RESULT });
+  await t.test("poll selects the current session binding before paging", async () => {
+    const f = await fixture(), oldSession = await f.session();
+    for (let n = 0; n < 31; n++) await f.request();
+    await f.bindings.revoke(f.op, f.binding.id);
+    const binding = await f.bindings.approveResourceFree(f.op, {
+      toolId: f.tool.id, deploymentId: f.deployment.id, revision: 2, artifactDigest: f.identity.artifactDigest,
+      expiresAt: new Date(Date.now() + 600000), execution: { profile: EXECUTION_PROFILE, ledgerId: randomUUID() },
+    });
+    const session = await f.execution.registerSession(f.context, {
+      bindingId: binding.id, ledgerId: binding.ledgerId!, artifactDigest: binding.artifactDigest,
+      executionProfile: EXECUTION_PROFILE, sessionKey: randomUUID(), ledgerProofDigest: "d".repeat(64),
+    });
+    const { inv } = await f.request();
+    const foreign = await fixture(), foreignSession = await foreign.session();
+    for (const id of [oldSession.id, foreignSession.id, "missing-session"]) {
+      assert.deepEqual((await f.protocol.poll(f.context, 1, id)).offers, []);
+    }
+    assert.deepEqual(await f.protocol.poll(f.context, 1, session.id), {
+      offers: [{ invocationId: inv.id, runId: inv.runId, versionId: inv.versionId, toolId: inv.toolId, executionAllowed: false }],
+      startAllowed: false,
+    });
+    assert.equal(await f.db.executorClaim.count({ where: { deploymentId: f.deployment.id } }), 0);
+    await f.admin.revokeCredential(f.credential.credentialId);
+    await assert.rejects(f.protocol.poll(f.context, 1, session.id));
+  });
   await t.test("concurrent starts commit one immutable identity and return only one permit", async () => {
     const f = await fixture(), c = await f.claimed();
     const starts = await Promise.all([f.execution.authorizeStart(f.context,c.claim.id,c.input),f.execution.authorizeStart(f.context,c.claim.id,c.input)]);

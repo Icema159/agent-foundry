@@ -27,7 +27,15 @@ async function main() {
   };
   verify();
   const ledger = new StartLedger("/ledger/ledger.sqlite", identity);
-  const runtime = new IsolatedExecutorRuntime(ledger, new HttpExecutorClient(validatePrivateOrigin(config.apiOrigin), config.credential), verify, undefined, profile===WRITE_PROFILE?(args,context)=>writeDemoReceipt(args,{invocationId:context.invocationId,outputResource:config.outputResource}):undefined);
+  const handler = profile === WRITE_PROFILE
+    ? (args: unknown, context: { invocationId: string }) => writeDemoReceipt(args, { invocationId: context.invocationId, outputResource: config.outputResource })
+    : undefined;
+  const runtime = new IsolatedExecutorRuntime(ledger, new HttpExecutorClient(validatePrivateOrigin(config.apiOrigin), config.credential), verify, undefined, handler, capacity => {
+    const warning = capacity.total >= capacity.warningAt;
+    const message = JSON.stringify({ event: "executor_recovery_capacity", level: warning ? "WARN" : "INFO", ...capacity });
+    if (warning) console.warn(message);
+    else console.info(message);
+  });
   try {
     await runtime.initialize(); console.log("Executor session ready; durable ledger reconciled");
     let stopped = false; process.once("SIGTERM", () => { stopped = true; }); process.once("SIGINT", () => { stopped = true; });

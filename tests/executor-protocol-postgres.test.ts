@@ -4,6 +4,8 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AddressInfo } from "node:net";
 import { Client } from "pg";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "../src/generated/prisma/client.js";
 import { createPrismaClient } from "../src/persistence/prisma-execution-store.js";
 import { PrismaIdentityStore } from "../src/identity/prisma-identity-store.js";
 import { CredentialAuthenticator, TrustedCredentialIssuer, TrustedIdentityAdministration, IdentityError, type Scope } from "../src/identity/identity.js";
@@ -74,6 +76,81 @@ test("isolated PostgreSQL: authenticated executor claims, leases and fencing", {
       assert.equal(await db.executorClaim.count({ where: { invocationId: f.invocation.id } }), 0);
       assert.equal(await db.invocationEvent.count({ where: { invocationId: f.invocation.id } }), 1);
     });
+    await t.test("poll advances across revoked pages and handles concurrent claim and insertion", async t => {
+      const f = await fixture();
+      async function request(grantId: string) {
+        const run = await invocations.openRun(f.agentContext, f.version.id);
+        return invocations.acceptInvocation(f.agentContext, { ...f.request, runId: run.id, grantId });
+      }
+      for (let n = 0; n < 60; n++) await request(f.grant.id);
+      await external.revoke(op.context, f.grant.id);
+      const elsewhere = await fixture(), foreign = await fixture({ op: await operator() });
+      const validGrant = await external.grant(op.context, { versionId: f.version.id, toolId: f.tool.id,
+        deploymentId: f.deployment.id, reviewedProfile: "READ_ONLY", allowedResources: [RESOURCE_FREE_RESOURCE] });
+      const contested = await request(validGrant.id), eligible = await request(validGrant.id);
+      const otherExecutor = await executor(op.owner.id, f.deployment.id);
+      const dbUrl = new URL(url!);
+      dbUrl.searchParams.set("application_name", "r2-poll-pages");
+      const observed = new PrismaClient({ adapter: new PrismaPg({ connectionString: dbUrl.href }), log: [{ level: "query", emit: "event" }] });
+      t.after(() => observed.$disconnect());
+      const statements: string[] = [];
+      observed.$on("query", event => statements.push(event.query));
+      const paging = new ExecutorProtocol(observed);
+      async function pollMeasured() {
+        statements.length = 0;
+        const result = await paging.poll(f.claimant.context);
+        const metrics = {
+          selects: statements.filter(sql => /^SELECT\b/i.test(sql.trim())).length,
+          // Prisma's query events omit adapter BEGIN/COMMIT. Each withInvocation
+          // transaction takes this run lock once before any authorization checks.
+          transactions: statements.filter(sql => sql.includes('SELECT status FROM "ExternalRun"') && sql.includes("FOR UPDATE")).length,
+          pageQueries: statements.filter(sql => sql.includes('ORDER BY "public"."Invocation"."createdAt" ASC')).length,
+        };
+        t.diagnostic(JSON.stringify(metrics));
+        assert.equal(metrics.pageQueries, 1);
+        assert.ok(metrics.transactions <= 40);
+        return { result, metrics };
+      }
+      const first = await pollMeasured();
+      assert.deepEqual(first.result.offers, []);
+      assert.equal(first.metrics.transactions, 30);
+      const added = await request(validGrant.id);
+      assert.deepEqual((await paging.poll(elsewhere.claimant.context)).offers.map(o => o.invocationId), [elsewhere.invocation.id]);
+      assert.deepEqual((await paging.poll(foreign.claimant.context)).offers.map(o => o.invocationId), [foreign.invocation.id]);
+      assert.deepEqual((await paging.poll(otherExecutor.context)).offers, []);
+      const second = await pollMeasured();
+      assert.deepEqual(second.result.offers, []);
+      assert.equal(second.metrics.transactions, 30);
+
+      const holder = new Client({ connectionString: url! }), claimDb = tagged("r2-poll-claim");
+      await holder.connect();
+      const pending: Promise<unknown>[] = [];
+      try {
+        await holder.query("BEGIN");
+        await holder.query('SELECT id FROM "ExternalRun" WHERE id=$1 FOR UPDATE', [contested.runId]);
+        const claim = new ExecutorProtocol(claimDb).claim(otherExecutor.context, contested.id, "concurrent");
+        pending.push(claim);
+        await waitForLock("r2-poll-claim");
+        const third = pollMeasured();
+        pending.push(third);
+        await waitForLock("r2-poll-pages");
+        await holder.query("COMMIT");
+        await claim;
+        assert.deepEqual((await third).result.offers.map(o => o.invocationId), [eligible.id]);
+      } finally {
+        await holder.query("ROLLBACK");
+        await Promise.allSettled(pending);
+        await holder.end();
+        await claimDb.$disconnect();
+      }
+      await assert.rejects(paging.claim(f.claimant.context, contested.id, "duplicate"), ExecutorConflict);
+      assert.equal(await db.executorClaim.count({ where: { invocationId: contested.id } }), 1);
+      assert.equal(await db.executorStart.count({ where: { invocationId: { in: [contested.id, eligible.id, added.id] } } }), 0);
+      assert.equal(await db.invocation.count({ where: { grantId: f.grant.id, status: "READY" } }), 61);
+      assert.deepEqual((await pollMeasured()).result.offers, []);
+      assert.deepEqual((await pollMeasured()).result.offers, []);
+      assert.deepEqual((await pollMeasured()).result.offers.map(o => o.invocationId), [eligible.id, added.id]);
+    });
     await t.test("claim identity, snapshot and generation survive inspection and duplicate requests", async () => {
       const f = await fixture();
       const results = await Promise.all(Array.from({ length: 3 }, () => protocol.claim(f.claimant.context, f.invocation.id, "same-key")));
@@ -119,6 +196,7 @@ test("isolated PostgreSQL: authenticated executor claims, leases and fencing", {
         const f = await fixture();
         if (change === "revoke") await admin.revokeCredential(f.claimant.token.credentialId);
         else await db.credential.update({ where: { id: f.claimant.token.credentialId }, data: change === "expire" ? { expiresAt: new Date(0) } : { scopes: ["executor:identify"] } });
+        await assert.rejects(protocol.poll(f.claimant.context), IdentityError);
         await assert.rejects(protocol.claim(f.claimant.context, f.invocation.id, change), IdentityError);
       }
     });
@@ -262,6 +340,7 @@ test("isolated PostgreSQL: authenticated executor claims, leases and fencing", {
         assert.equal((await call(prefix + "/poll", undefined, {}, "GET")).status, 405);
         assert.equal((await call(prefix + "/poll", undefined, { limit: 11 })).status, 400);
         assert.equal((await call(prefix + "/poll", undefined, { deploymentId: f.deployment.id })).status, 400);
+        assert.equal((await call(prefix + "/poll", undefined, { cursor: f.invocation.id })).status, 400);
         assert.equal((await call(prefix + "/poll", undefined, undefined, "POST", "{bad")).status, 400);
         assert.equal((await call(prefix + "/poll", undefined, {}, "POST", undefined, "text/plain")).status, 415);
         assert.equal((await call(prefix + "/poll", undefined, undefined, "POST", "x".repeat(66000))).status, 413);

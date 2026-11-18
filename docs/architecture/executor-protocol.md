@@ -68,7 +68,7 @@ key never creates a replacement claim. Use a new key only after reconciling a pr
 pre-start release/expiration. Duplicate polls never reserve work.
 
 `FOUNDRY_EXECUTOR_LEASE_MS` defaults to 30000 and accepts integer values from 1000
-through 120000, read once at API startup. Empty/invalid values fail configuration.
+through 120000, read once at startup by both the loopback and private Docker APIs. Pass the variable into the private API container to override its default. Empty/invalid values fail configuration.
 Deadlines are capped by the executor credential and pinned requester/binding expiry.
 Only the same principal AND exact credential can inspect/renew/release its claim.
 Credential rotation does not transfer a claim. Superseded generations are rejected.
@@ -88,10 +88,28 @@ Renewal requires current unexpired fencing and authorization; elapsed leases can
 be revived. Generation changes, state changes and their audit events commit together.
 Two concurrent claims have one winner; the loser cannot overwrite assignment state.
 
-Polling reconciles at most 10 existing claims, then checks at most 30 READY candidates
-and returns up to 10 eligible offers. This is bounded polling, not a fairness or
-production scheduling guarantee. Unclaimed READY records with stale authorization
-are omitted and rejected at claim; their status is not automatically rewritten.
+Polling reconciles at most 10 existing claims, then checks one page of at most 30
+READY candidates and returns up to 10 offers. Each checked row uses an existing
+per-Invocation transaction, for at most 40 such transactions per request.
+Selection filters by authenticated owner and deployment and, when supplied, the
+binding of the executor's own active session. Locked validation still runs before
+an offer and claim and start reauthorize independently.
+
+Continue polling after an empty response. The API keeps an internal keyset
+position ordered by `(createdAt, id)`, scoped to owner, deployment, principal,
+credential and session. It advances past the last checked row even if every row
+was ineligible, and wraps when the sweep reaches its end. The database timestamp
+at the start of the sweep bounds newly arriving work; rows that become READY
+behind the position are revisited on the following sweep. The HTTP schema
+accepts no client cursor. Overlapping requests can see the same offer, while
+the claim transaction continues to pick one winner.
+
+Positions are process-local hints with a 1,024-scope limit. A restart,
+least-recently-used eviction or a different replica can reset the position;
+progress assumes repeated polls on a process that retains the scope. An expired
+or unclaimable unclaimed READY row is skipped and retains its stored status.
+Polling provides no scheduling SLA and the row limit does not bound SQL rows
+scanned by the planner.
 
 On expiry, disconnection or claimant credential revocation, a claim may return to
 READY only if the Invocation is still CLAIMED, the exact active generation has no
@@ -211,7 +229,7 @@ waits. It atomically creates one immutable ExecutorStart, writes the claim marke
 START_AUTHORIZED state and event. A deferred DB constraint prevents partial commit.
 Unique Invocation/claim keys prevent two starts. Only the original response grants
 permission; identical retries return the same identity with **startAllowed:false**.
-Changed request identity conflicts. A claim ID alone is never a start permit.
+The fixed runner requires matching boolean `startAllowed` and `executionAllowed` flags, the expected ledger and the complete start identity before recording start intent. Malformed result acknowledgements leave the local result pending. Changed request identity conflicts. A claim ID alone is never a start permit.
 
 Start deadline is at most five seconds, capped by lease/authorization/credential/
 session expiry. The executor checks it immediately before the handler. Result
@@ -234,8 +252,11 @@ status/reason and the allowlisted health JSON, marked `EXECUTOR_REPORTED`.
 POST `/api/v1/executor/recovery` requires executor:report, the current session and
 matching ledgerProofDigest. It exposes bounded, owner/deployment/binding-scoped
 claim/start/report identity pages (100 records, stable claim ID cursor). Another
-binding's cursor is rejected. The runner checks every local record including ACKED
-against this inventory before recovering/polling, capped at 10,000 records. A new
+binding's cursor is rejected. The runner indexes local attempts by claim ID and
+matches report digests within their start. It rejects duplicate claim, start and
+report identities while checking every local record including ACKED before
+recovering or polling. See [recovery capacity](../operations/executor-recovery.md#recovery-capacity)
+for the bounds and operator diagnostics. A new
 incarnation, missing committed start/report, wrong generation/session/artifact or
 invalid ACK quarantines startup. Missing local evidence for a fenced pre-start claim
 without any start may be handled by existing pre-start reconciliation. No local
@@ -302,6 +323,12 @@ node scripts/test-isolated-executor.mjs start-loss
 node scripts/test-isolated-executor.mjs ack-loss
 node scripts/test-isolated-executor.mjs revoked-result
 ```
+
+The private API image installs the lockfile's production dependency tree on
+Linux with lifecycle scripts disabled. `npm run build:executor` supplies the
+compiled Prisma client in `dist/src`. npm retains the Prisma CLI and its
+dependency tree while resolving the production client's optional peer. The
+executor image carries bundled files without a project `node_modules` tree.
 
 The opt-in script creates a new isolated PostgreSQL container, applies migrations
 only there, provisions test-only identities/secrets/ledger and private networks,

@@ -1,5 +1,7 @@
-import { promises as fs } from "node:fs";
+import { constants, promises as fs, type BigIntStats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
+import { EXACT_LINE_COUNT_BYTES, REPOSITORY_CONTENT_BYTES, scanRepositoryText } from "./repository-text.js";
 import type { ToolSchema } from "../model/types.js";
 import { SandboxError, type Sandbox } from "../sandbox/sandbox.js";
 import {
@@ -9,7 +11,29 @@ import {
   type RegisteredTool,
 } from "./tool-registry.js";
 
-const IGNORED_DIRECTORY_NAMES = new Set([".git", "dist", "node_modules"]);
+const HIDDEN_PATH_COMPONENTS = new Set([
+  ".git", "dist", "node_modules",
+  ".ssh", ".aws", ".azure", ".kube", ".docker", ".gnupg", ".gcloud",
+  ".oci", ".terraform", ".vault", ".secrets", ".credentials",
+  ".envrc", ".npmrc", ".yarnrc", ".yarnrc.yml", ".netrc", "_netrc", ".pypirc",
+  ".git-credentials", ".gitconfig", ".gitmodules", ".gh", ".vault-token",
+  ".pgpass", ".my.cnf", ".htpasswd", ".dockercfg", "kubeconfig",
+  "credentials", "credentials.json", "secrets.json", "tokens.json",
+  "auth.json", "htpasswd", "application_default_credentials.json",
+]);
+
+function isHiddenPath(relativePath: string): boolean {
+  const parts = relativePath.split(path.sep).map(part => part.normalize("NFKC").toLowerCase());
+  return parts.some((part, index) =>
+    HIDDEN_PATH_COMPONENTS.has(part) ||
+    (parts[index - 1] === ".config" && ["gcloud", "gh", "stripe", "doctl"].includes(part)) ||
+    /^\.env(?:\.|$)/.test(part) ||
+    /^id_(?:rsa|dsa|ecdsa|ed25519)(?:_sk)?$/.test(part) ||
+    /^(?:service[-_]account|client[-_]secret)(?:[-_][^.]*)?\.json$/.test(part) ||
+    /\.(?:env|pem|key|p12|pfx|ppk|jks|keystore|kdbx|tfstate)(?:\.backup)?$/.test(part));
+}
+
+const unavailableFile = () => new ToolInputError("Requested repository file is unavailable");
 
 export { ToolExecutionError, ToolInputError } from "./tool-registry.js";
 
@@ -21,7 +45,7 @@ export const repositoryToolSchemas: ToolSchema[] = [
   },
   {
     name: "search_files",
-    description: "Find literal text in UTF-8 repository files and return matching lines.",
+    description: "Find literal text in UTF-8 repository files. When complete is false, scan or output limits prevented a complete search.",
     inputSchema: {
       type: "object",
       properties: {
@@ -33,7 +57,7 @@ export const repositoryToolSchemas: ToolSchema[] = [
   },
   {
     name: "read_file",
-    description: "Read one UTF-8 file relative to the repository root. For large files, request a smaller portion using startLine (1-based) and maxLines.",
+    description: "Read one UTF-8 repository file. For large files, use startLine (1-based) and maxLines. A missing totalLines on a range means the file length was not determined. Check truncationReason for scan or output limits.",
     inputSchema: {
       type: "object",
       properties: {
@@ -97,28 +121,98 @@ class RepositoryOperations {
     return files.sort();
   }
 
-  async searchFiles(query: string): Promise<Array<{ path: string; line: number; text: string }>> {
+  async searchFiles(query: string) {
     const matches: Array<{ path: string; line: number; text: string }> = [];
+    let outputBytes = 0;
+    let incomplete = false;
     for (const relativePath of await this.listFiles()) {
-      let content: string;
+      const fileMatches: typeof matches = [];
+      let fileBytes = 0;
+      let skippedLine = false;
+      let exhaustedOutput = false;
       try {
-        content = await this.readFile(relativePath);
+        const scan = await this.withVisibleFile(relativePath, (file, size) =>
+          scanRepositoryText(file, size, (line, _bytes, content) => {
+            if (content === undefined) {
+              skippedLine = true;
+              return;
+            }
+            const text = content.endsWith("\n") ? content.slice(0, content.endsWith("\r\n") ? -2 : -1) : content;
+            if (!text.includes(query)) return;
+            const match = { path: relativePath, line, text };
+            const matchBytes = Buffer.byteLength(JSON.stringify(match)) + 1;
+            if (outputBytes + fileBytes + matchBytes > REPOSITORY_CONTENT_BYTES) {
+              exhaustedOutput = true;
+              return false;
+            }
+            fileMatches.push(match);
+            fileBytes += matchBytes;
+          }));
+        incomplete ||= !scan.eof || skippedLine || exhaustedOutput;
       } catch {
         continue;
       }
-      content.split(/\r?\n/).forEach((text, index) => {
-        if (text.includes(query)) matches.push({ path: relativePath, line: index + 1, text });
-      });
+      for (const match of fileMatches) matches.push(match);
+      outputBytes += fileBytes;
+      if (exhaustedOutput) break;
     }
-    return matches;
+    return { matches, ...(incomplete ? { complete: false } : {}) };
   }
 
-  async readFile(relativePath: string): Promise<string> {
-    const absolute = await this.resolveExistingFile(relativePath);
+  async readFile(relativePath: string, startLine?: number, maxLines?: number) {
+    const start = startLine ?? 1;
+    const parts: string[] = [];
+    let returnedLines = 0;
+    let outputBytes = 0;
+    let exhaustedOutput = false;
+    const scan = await this.withVisibleFile(relativePath, (file, size) => {
+      const countToEnd = size <= BigInt(EXACT_LINE_COUNT_BYTES);
+      return scanRepositoryText(file, size, (line, bytes, text) => {
+        if (line < start) return;
+        if (!exhaustedOutput && (maxLines === undefined || returnedLines < maxLines)) {
+          // JSON escaping can increase the size of the model-visible content.
+          const encodedBytes = text === undefined ? bytes : Buffer.byteLength(JSON.stringify(text)) - 2;
+          if (text === undefined || outputBytes + encodedBytes > REPOSITORY_CONTENT_BYTES) {
+            exhaustedOutput = true;
+          } else {
+            parts.push(text);
+            outputBytes += encodedBytes;
+            returnedLines++;
+          }
+        }
+        if (!countToEnd && (exhaustedOutput || returnedLines === maxLines)) return false;
+      });
+    });
+    const content = parts.join("");
+    const truncationReason = exhaustedOutput ? "OUTPUT_LIMIT" : scan.scanLimited ? "SCAN_LIMIT" : undefined;
+    if (startLine === undefined && maxLines === undefined && !truncationReason) return { path: relativePath, content };
+    return {
+      path: relativePath, content, startLine: start,
+      endLine: returnedLines ? start + returnedLines - 1 : scan.eof && scan.lines < start ? scan.lines : null,
+      ...(scan.eof ? { totalLines: scan.lines } : {}),
+      complete: start === 1 && scan.eof && returnedLines === scan.lines && !truncationReason,
+      ...(truncationReason ? { truncationReason } : {}),
+    };
+  }
+
+  private async withVisibleFile<T>(relativePath: string, read: (file: FileHandle, size: bigint) => Promise<T>): Promise<T> {
     try {
-      return await fs.readFile(absolute, "utf8");
+      const { absolute, stat } = await this.resolveVisiblePath(relativePath, "file");
+      const file = await fs.open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try {
+        const opened = await file.stat({ bigint: true });
+        const current = await this.resolveVisiblePath(relativePath, "file");
+        if (!sameFile(stat, opened) || !sameFile(current.stat, opened)) throw unavailableFile();
+        const result = await read(file, opened.size);
+        const finalPath = await this.resolveVisiblePath(relativePath, "file");
+        if (!sameFile(opened, finalPath.stat) || !sameFile(opened, await file.stat({ bigint: true }))) throw unavailableFile();
+        return result;
+      } finally {
+        await file.close();
+      }
     } catch (error) {
-      throw new ToolExecutionError(errorMessage(error));
+      if (error instanceof ToolInputError) throw error;
+      throw unavailableFile();
     }
   }
 
@@ -165,38 +259,45 @@ class RepositoryOperations {
     let entries;
     try {
       entries = await fs.readdir(directory, { withFileTypes: true });
-    } catch (error) {
-      throw new ToolExecutionError(errorMessage(error));
+    } catch {
+      throw new ToolExecutionError("Repository directory is unavailable");
     }
     for (const entry of entries) {
-      if (entry.isSymbolicLink()) continue;
-      if (entry.isDirectory() && IGNORED_DIRECTORY_NAMES.has(entry.name)) continue;
-      const absolute = path.join(directory, entry.name);
-      if (entry.isDirectory()) await this.walk(absolute, files);
-      else if (entry.isFile()) files.push(toPosix(path.relative(this.root, absolute)));
+      if (!entry.isDirectory() && !entry.isFile()) continue;
+      const relative = path.relative(this.root, path.join(directory, entry.name));
+      const kind = entry.isDirectory() ? "directory" : "file";
+      let absolute: string;
+      try {
+        ({ absolute } = await this.resolveVisiblePath(relative, kind));
+      } catch {
+        continue;
+      }
+      if (kind === "directory") await this.walk(absolute, files);
+      else files.push(toPosix(relative));
     }
   }
 
-  private async resolveExistingFile(relativePath: string): Promise<string> {
-    if (path.isAbsolute(relativePath)) {
-      throw new ToolInputError("File path must be relative to the workspace root");
-    }
+  private async resolveVisiblePath(relativePath: string, kind: "file" | "directory") {
+    if (path.isAbsolute(relativePath)) throw unavailableFile();
     const candidate = path.resolve(this.root, relativePath);
-    if (!isInside(this.root, candidate)) {
-      throw new ToolInputError("File path escapes the workspace root");
+    const relative = path.relative(this.root, candidate);
+    if (!relative || !isInside(this.root, candidate) || isHiddenPath(relative)) throw unavailableFile();
+
+    // Reject links at every component, including aliases through a symlinked directory.
+    const components = relative.split(path.sep);
+    let parent = this.root;
+    for (const component of components.slice(0, -1)) {
+      parent = path.join(parent, component);
+      if (!(await fs.lstat(parent)).isDirectory()) throw unavailableFile();
     }
-    let realPath: string;
-    try {
-      realPath = await fs.realpath(candidate);
-    } catch (error) {
-      throw new ToolExecutionError(errorMessage(error));
+    const stat = await fs.lstat(candidate, { bigint: true });
+    if (kind === "file" ? !stat.isFile() || stat.nlink !== 1n : !stat.isDirectory()) throw unavailableFile();
+
+    const absolute = await fs.realpath(candidate);
+    if (absolute !== candidate || !isInside(this.root, absolute) || isHiddenPath(path.relative(this.root, absolute))) {
+      throw unavailableFile();
     }
-    if (!isInside(this.root, realPath)) {
-      throw new ToolInputError("File path resolves outside the workspace root");
-    }
-    const stat = await fs.stat(realPath);
-    if (!stat.isFile()) throw new ToolInputError("Requested path is not a regular file");
-    return realPath;
+    return { absolute, stat };
   }
 }
 
@@ -224,7 +325,7 @@ function createDefinitions(
       },
       execute: async (args) => {
         const { query } = args as { query: string };
-        return { matches: await operations.searchFiles(query) };
+        return operations.searchFiles(query);
       },
     },
     {
@@ -238,14 +339,7 @@ function createDefinitions(
       },
       execute: async (args) => {
         const { path: relativePath, startLine, maxLines } = args as { path: string; startLine?: number; maxLines?: number };
-        const content = await operations.readFile(relativePath);
-        if (startLine === undefined && maxLines === undefined) return { path: relativePath, content };
-        const lines = content.match(/[^\n]*\n|[^\n]+$/g) ?? [];
-        const start = startLine ?? 1;
-        const end = maxLines === undefined ? lines.length : Math.min(lines.length, start - 1 + maxLines);
-        return { path: relativePath, content: lines.slice(start - 1, end).join(""),
-          startLine: start, endLine: end, totalLines: lines.length,
-          complete: start === 1 && end === lines.length };
+        return operations.readFile(relativePath, startLine, maxLines);
       },
     },
     {
@@ -323,6 +417,12 @@ function isInside(root: string, candidate: string): boolean {
     relative === "" ||
     (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))
   );
+}
+
+function sameFile(expected: BigIntStats, actual: BigIntStats): boolean {
+  return actual.isFile() && actual.nlink === 1n &&
+    expected.dev === actual.dev && expected.ino === actual.ino &&
+    expected.size === actual.size && expected.mtimeNs === actual.mtimeNs && expected.ctimeNs === actual.ctimeNs;
 }
 
 function toPosix(value: string): string {

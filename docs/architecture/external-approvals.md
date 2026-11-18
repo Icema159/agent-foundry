@@ -48,6 +48,8 @@ Invocation, different inputs or artifact. To withdraw authority after APPROVE, u
 existing trusted grant/binding/credential revocation; do not overwrite the decision.
 Invalid unclaimed READY records may remain stored READY with INVALIDATED/EXPIRED
 approval view and executionAllowed=false; automatic pre-start cleanup is not added.
+The [executor poll sweep](executor-protocol.md#locking-reauthorization-and-reconciliation)
+skips these rows and can discover eligible work beyond them.
 Claim reconciliation can close invalid pre-start claims. This availability limitation
 must not be bypassed by resetting state or recycling an uncertain Invocation.
 

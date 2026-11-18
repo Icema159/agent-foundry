@@ -8,6 +8,10 @@ export function executorLeaseMs(raw: string | undefined): number {
   return value;
 }
 
+export function executorProtocolOptions(env: NodeJS.ProcessEnv) {
+  return { leaseMs: executorLeaseMs(env.FOUNDRY_EXECUTOR_LEASE_MS) };
+}
+
 export function generation(value: unknown): number {
   if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 2147483647)
     throw new ValidationError("Invalid claim generation");

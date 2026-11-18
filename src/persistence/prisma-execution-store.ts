@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "../generated/prisma/client.js";
 import type { TerminalRuntimeResult } from "../runtime/agent-runtime.js";
@@ -6,6 +7,7 @@ import { parsePostconditions, type TaskPostcondition } from "../verification/tas
 import type {
   AgentDefinition,
   ApprovalDecision,
+  DeliveryOutcome,
   ExecutionStore,
   LoadedExecution,
   PendingExecution,
@@ -55,7 +57,8 @@ export class PrismaExecutionStore implements ExecutionStore {
     prompt: string,
     workspaceRoot: string,
     postconditions: TaskPostcondition[] = [],
-  ): Promise<PendingExecution> {
+  ): Promise<PendingExecution & { deliveryId: string }> {
+    const deliveryId = `delivery-${randomUUID()}`;
     return this.prisma.$transaction(async (transaction) => {
       const task = await transaction.task.create({
         data: { agentId, prompt, workspaceRoot, postconditions: parsePostconditions(postconditions), status: "PENDING" },
@@ -65,9 +68,24 @@ export class PrismaExecutionStore implements ExecutionStore {
           taskId: task.id,
           agentVersionId,
           status: "PENDING",
+          deliveryId,
+          deliveries: { create: { id: deliveryId, source: "SUBMISSION" } },
         },
       });
-      return { taskId: task.id, taskRunId: run.id };
+      return { taskId: task.id, taskRunId: run.id, deliveryId };
+    });
+  }
+
+  async beginDeliveryAttempt(deliveryId: string, actor: string): Promise<string> {
+    const attempt = await this.prisma.taskRunDeliveryAttempt.create({
+      data: { deliveryId, actor, manual: false }, select: { id: true },
+    });
+    return attempt.id;
+  }
+
+  async finishDeliveryAttempt(attemptId: string, outcome: DeliveryOutcome): Promise<void> {
+    await this.prisma.taskRunDeliveryAttempt.update({
+      where: { id: attemptId }, data: { outcome, finishedAt: new Date() },
     });
   }
 
@@ -142,15 +160,25 @@ export class PrismaExecutionStore implements ExecutionStore {
     taskRunId: string,
     workerId: string,
     now: Date,
+    jobId?: string,
   ): Promise<void> {
     if (taskRunId.startsWith("ext_")) throw new Error("External runs cannot enter reference execution");
     await this.prisma.$transaction(async (transaction) => {
       const updated = await transaction.taskRun.updateMany({
-        where: { id: taskRunId, taskId, status: "PENDING" },
+        where: { id: taskRunId, taskId, status: "PENDING",
+          ...(jobId === undefined ? {} : { deliveryId: /^\d+$/.test(jobId) ? null : jobId }) },
         data: { status: "RUNNING", workerId, heartbeatAt: now, startedAt: now },
       });
       if (updated.count !== 1) {
         throw new Error(`TaskRun ${taskRunId} could not transition from PENDING to RUNNING`);
+      }
+      const { deliveryId } = await transaction.taskRun.findUniqueOrThrow({
+        where: { id: taskRunId }, select: { deliveryId: true },
+      });
+      if (deliveryId) {
+        await transaction.taskRunDelivery.update({
+          where: { id: deliveryId, taskRunId, claimedAt: null }, data: { claimedAt: now },
+        });
       }
       await transaction.task.update({
         where: { id: taskId },
@@ -271,7 +299,7 @@ export class PrismaExecutionStore implements ExecutionStore {
   async decideApproval(
     approvalId: string,
     decision: ApprovalDecision,
-  ): Promise<{ taskRunId: string }> {
+  ): Promise<{ taskRunId: string; deliveryId: string }> {
     return this.prisma.$transaction(async (transaction) => {
       const approval = await transaction.approval.findUnique({
         where: { id: approvalId },
@@ -289,11 +317,13 @@ export class PrismaExecutionStore implements ExecutionStore {
         data: { status: decision, decidedAt: new Date() },
       });
       if (decided.count !== 1) throw new Error(`Approval ${approvalId} was already decided`);
+      const deliveryId = `delivery-${randomUUID()}`;
       const moved = await transaction.taskRun.updateMany({
         where: { id: approval.taskRunId, status: "WAITING_FOR_APPROVAL" },
-        data: { status: "PENDING", workerId: null, heartbeatAt: null },
+        data: { status: "PENDING", workerId: null, heartbeatAt: null, deliveryId },
       });
       if (moved.count !== 1) throw new Error(`TaskRun ${approval.taskRunId} is no longer waiting`);
+      await transaction.taskRunDelivery.create({ data: { id: deliveryId, taskRunId: approval.taskRunId, source: "APPROVAL" } });
       await transaction.task.update({
         where: { id: approval.taskRun.taskId },
         data: { status: "PENDING" },
@@ -319,7 +349,7 @@ export class PrismaExecutionStore implements ExecutionStore {
           },
         },
       });
-      return { taskRunId: approval.taskRunId };
+      return { taskRunId: approval.taskRunId, deliveryId };
     });
   }
 
@@ -440,6 +470,7 @@ export class PrismaExecutionStore implements ExecutionStore {
         return { action: "FAILED_LIMIT" };
       }
       const recoveryCount = run.recoveryCount + 1;
+      const deliveryId = `delivery-${randomUUID()}`;
       const recovered = await transaction.taskRun.updateMany({
         where: staleWhere,
         data: {
@@ -447,12 +478,14 @@ export class PrismaExecutionStore implements ExecutionStore {
           workerId: null,
           heartbeatAt: null,
           recoveryCount,
+          deliveryId,
           failureReason: null,
           failureMessage: null,
           completedAt: null,
         },
       });
       if (recovered.count !== 1) return { action: "SKIPPED" };
+      await transaction.taskRunDelivery.create({ data: { id: deliveryId, taskRunId, source: "RECOVERY" } });
       const latest = await transaction.step.findFirst({ where: { taskRunId }, orderBy: { sequence: "desc" }, select: { sequence: true } });
       await transaction.step.create({ data: {
         taskRunId, sequence: (latest?.sequence ?? 0) + 1, kind: "RUNTIME_FAILURE",
@@ -462,7 +495,7 @@ export class PrismaExecutionStore implements ExecutionStore {
         where: { id: run.taskId },
         data: { status: "PENDING" },
       });
-      return { action: "REQUEUE", recoveryCount };
+      return { action: "REQUEUE", recoveryCount, deliveryId };
     });
   }
 

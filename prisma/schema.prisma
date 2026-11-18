@@ -34,6 +34,19 @@ enum StepKind {
   APPROVAL_DENIED
 }
 
+enum DeliverySource {
+  SUBMISSION
+  APPROVAL
+  RECOVERY
+}
+
+enum DeliveryOutcome {
+  UNCONFIRMED
+  CONFIRMED
+  NOT_SENT
+  ACK_UNKNOWN
+}
+
 enum AgentIntegration {
   REFERENCE
   EXTERNAL
@@ -508,7 +521,35 @@ model TaskRun {
   startedAt      DateTime?
   completedAt    DateTime?
 
+  deliveryId     String?
+  deliveries     TaskRunDelivery[]
+
   @@index([status, heartbeatAt])
+}
+
+model TaskRunDelivery {
+  id        String               @id
+  taskRunId String
+  taskRun   TaskRun              @relation(fields: [taskRunId], references: [id], onDelete: Restrict)
+  source    DeliverySource
+  createdAt DateTime             @default(now())
+  claimedAt DateTime?
+  attempts  TaskRunDeliveryAttempt[]
+
+  @@index([taskRunId, createdAt])
+}
+
+model TaskRunDeliveryAttempt {
+  id         String          @id @default(cuid())
+  deliveryId String
+  delivery   TaskRunDelivery @relation(fields: [deliveryId], references: [id], onDelete: Restrict)
+  actor      String
+  manual     Boolean
+  outcome    DeliveryOutcome @default(UNCONFIRMED)
+  createdAt  DateTime        @default(now())
+  finishedAt DateTime?
+
+  @@index([deliveryId, createdAt])
 }
 
 model Approval {

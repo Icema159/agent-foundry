@@ -24,9 +24,11 @@ export type ResolvedAgentVersion = {
   agentVersionId: string;
 };
 
-export type PendingExecution = {
+export type DeliveryOutcome = "CONFIRMED" | "NOT_SENT" | "ACK_UNKNOWN";
+export type PendingDelivery = { taskRunId: string; deliveryId?: string };
+
+export type PendingExecution = PendingDelivery & {
   taskId: string;
-  taskRunId: string;
 };
 
 export type LoadedExecution = PendingExecution & {
@@ -52,7 +54,7 @@ export type StaleExecution = {
 };
 
 export type RecoveryDecision =
-  | { action: "REQUEUE"; recoveryCount: number }
+  | { action: "REQUEUE"; recoveryCount: number; deliveryId?: string }
   | { action: "FAILED_LIMIT" }
   | { action: "SKIPPED" };
 
@@ -93,7 +95,7 @@ export interface ExecutionStore {
     postconditions?: TaskPostcondition[],
   ): Promise<PendingExecution>;
   loadExecution(taskRunId: string): Promise<LoadedExecution>;
-  claimExecution(taskId: string, taskRunId: string, workerId: string, now: Date): Promise<void>;
+  claimExecution(taskId: string, taskRunId: string, workerId: string, now: Date, jobId?: string): Promise<void>;
   heartbeat(taskRunId: string, workerId: string, now: Date): Promise<void>;
   appendStep(taskRunId: string, workerId: string, step: PersistedStep): Promise<void>;
   completeModelCall(
@@ -111,7 +113,9 @@ export interface ExecutionStore {
     step: PersistedStep,
   ): Promise<{ approvalId: string }>;
   listPendingApprovals(): Promise<PendingApproval[]>;
-  decideApproval(approvalId: string, decision: ApprovalDecision): Promise<{ taskRunId: string }>;
+  decideApproval(approvalId: string, decision: ApprovalDecision): Promise<PendingDelivery>;
+  beginDeliveryAttempt?(deliveryId: string, actor: string): Promise<string>;
+  finishDeliveryAttempt?(attemptId: string, outcome: DeliveryOutcome): Promise<void>;
   claimApprovalAction(
     taskRunId: string,
     workerId: string,

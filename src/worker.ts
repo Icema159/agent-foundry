@@ -33,9 +33,11 @@ async function main(): Promise<void> {
     AGENT_TASK_QUEUE,
     async (job: Job<AgentTaskJobData>) => {
       const taskRunId = requireTaskRunId(job.data);
+      if (!job.id) throw new Error("Queue job identity is required");
       console.log(`Processing task run ${taskRunId}`);
       const result = await processTaskRun({
         taskRunId,
+        jobId: job.id,
         workerId,
         heartbeatIntervalMs,
         store,

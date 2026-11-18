@@ -14,6 +14,7 @@ export type WorkerRuntimeFactory = (
 
 export async function processTaskRun(options: {
   taskRunId: string;
+  jobId?: string;
   workerId: string;
   heartbeatIntervalMs: number;
   store: ExecutionStore;
@@ -25,6 +26,7 @@ export async function processTaskRun(options: {
     execution.taskRunId,
     options.workerId,
     new Date(),
+    options.jobId,
   );
   const heartbeat = new ExecutionHeartbeat(options.heartbeatIntervalMs, () =>
     options.store.heartbeat(execution.taskRunId, options.workerId, new Date()),

@@ -212,6 +212,12 @@ npm run eval:compare -- locate-model-provider-factory
 
 Recovery is an **explicit stale-run scan**, not a worker-started periodic service. It restarts only strictly read-only Repository Explorer runs, not individual steps. Create/delete-capable versions, including current defaults, are ineligible even when writes require approval. Confirmed stale, non-recoverable runs are marked FAILED with `RECOVERY_NOT_SAFE` without restarting execution or asserting a side-effect outcome. See [recovery policy and crash-window limitations](docs/architecture/execution-pipeline.md#10-whole-run-recovery-and-current-limitations).
 
+Use `npm run delivery -- list`, `npm run delivery -- inspect TASK_RUN_ID`, or
+`npm run delivery -- reconcile TASK_RUN_ID` for reference runs whose delivery
+needs investigation. Apply migration `20261113000000_reference_delivery` and
+upgrade the reference producers and workers together before using reconciliation.
+See [delivery evidence and repair limits](docs/architecture/execution-pipeline.md#reference-delivery-diagnostics-and-repair).
+
 Evals submit normal TaskRuns and score persisted behavior. They are deterministic assertion-based smoke cases, not LLM judges or contamination-resistant benchmarks. Model comparisons require equivalent persisted agent configurations. Eval timeout does not cancel the underlying run.
 
 ## Verification
@@ -224,6 +230,19 @@ npm run build:dashboard
 ```
 
 Automated tests use fake model providers and do not require real Ollama/OpenAI API calls. Dashboard tests open a local HTTP listener. Real-model smoke testing is a separate activity: R2 has been exercised with Qwen; R3 is covered by deterministic tests but has not yet had a real-Qwen corrective-loop smoke test.
+
+Run `npm run test:integration` for mandatory PostgreSQL validation. It requires
+all nine isolated test database URLs listed in [the runner](scripts/test-postgres.mjs)
+and fails on skipped tests. Use fresh local databases with the names required by
+the test suites. The identity suite needs an empty database. Apply migrations
+to the other eight isolated databases before running the command.
+
+The separate reference delivery suite uses a fresh migrated
+`foundry_delivery_test_*` database on loopback, a disposable loopback Redis
+on a nondefault port and an unused port for the outage case. Set
+`FOUNDRY_DELIVERY_TEST_DATABASE_URL`, `FOUNDRY_DELIVERY_TEST_REDIS_URL` and
+`FOUNDRY_DELIVERY_OFFLINE_REDIS_PORT`, then run
+`node --test dist/tests/delivery-postgres.test.js` after building.
 
 ## Security and current limitations
 

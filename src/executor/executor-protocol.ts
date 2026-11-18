@@ -13,10 +13,15 @@ export type ExecutorScope = "executor:claim" | "executor:lease" | "executor:sess
 export type Loaded = Prisma.InvocationGetPayload<{ include: { authorization: true; claims: true } }>;
 export { ExecutorConflict } from "./protocol-errors.js";
 const conflict = (code: string) => new ExecutorConflict(code);
+const POLL_PAGE_SIZE = 30;
+const MAX_POLL_SCOPES = 1024;
+type PollPosition = { createdAt: Date; id: string };
+type PollProgress = { through: Date; after?: PollPosition };
 
 /** Claim metadata only: no dispatch, handler, start permit, result or reference queue. */
 export class ExecutorProtocol {
   private readonly leaseMs: number;
+  private readonly pollProgress = new Map<string, PollProgress>();
   constructor(private readonly db: PrismaClient, options: { leaseMs?: number } = {}) {
     this.leaseMs = executorLeaseMs(options.leaseMs === undefined ? undefined : String(options.leaseMs));
   }
@@ -92,17 +97,61 @@ export class ExecutorProtocol {
     const active = await this.db.executorClaim.findMany({ where: { ownerId: context.ownerId, deploymentId: context.deploymentId!, status: "ACTIVE", invocation: { status: { in: ["CLAIMED", "START_AUTHORIZED"] } } },
       orderBy: [{ leaseExpiresAt: "asc" }, { id: "asc" }], take: 10, select: { invocationId: true } });
     for (const claim of active) await this.withInvocation(context, claim.invocationId, "executor:claim", (tx, inv, _cred, open) => this.reconcile(tx, inv, context, open));
-    const candidates = await this.db.invocation.findMany({ where: { ownerId: context.ownerId, deploymentId: context.deploymentId!, status: "READY", run: { status: "RUNNING" } },
-      orderBy: [{ createdAt: "asc" }, { id: "asc" }], take: 30, select: { id: true } });
     const offers: Array<{ invocationId: string; runId: string; versionId: string; toolId: string; executionAllowed: false }> = [];
+    const scope = JSON.stringify([context.ownerId, context.deploymentId, context.principalId, context.credentialId, sessionId ?? null]);
+    let bindingId: string | undefined;
+    if (sessionId !== undefined) {
+      // Selection hint only. The locked session/binding check still runs before an offer.
+      const session = await this.db.executorSession.findFirst({
+        where: { id: sessionId, ownerId: context.ownerId, deploymentId: context.deploymentId!,
+          executorPrincipalId: context.principalId, credentialId: context.credentialId, active: true },
+        select: { bindingId: true },
+      });
+      if (!session) {
+        this.pollProgress.delete(scope);
+        return { offers, startAllowed: false as const };
+      }
+      bindingId = session.bindingId;
+    }
+
+    let progress = this.pollProgress.get(scope);
+    if (!progress) {
+      // A fixed sweep cutoff lets later inserts wait for the next sweep.
+      const through = await databaseNow(this.db);
+      progress = this.pollProgress.get(scope) ?? { through };
+    }
+    // Insertion order bounds inactive scopes without persisting scheduling hints.
+    this.pollProgress.delete(scope);
+    this.pollProgress.set(scope, progress);
+    if (this.pollProgress.size > MAX_POLL_SCOPES) {
+      const oldest = this.pollProgress.keys().next().value;
+      if (oldest !== undefined) this.pollProgress.delete(oldest);
+    }
+
+    const after = progress.after;
+    const candidates = await this.db.invocation.findMany({
+      where: { ownerId: context.ownerId, deploymentId: context.deploymentId!, status: "READY", run: { status: "RUNNING" },
+        ...(bindingId === undefined ? {} : { authorization: { is: { bindingId } } }),
+        createdAt: { lte: progress.through },
+        ...(after ? { OR: [{ createdAt: { gt: after.createdAt } }, { createdAt: after.createdAt, id: { gt: after.id } }] } : {}),
+      },
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }], take: POLL_PAGE_SIZE, select: { id: true, createdAt: true },
+    });
+    let examined = 0;
     for (const candidate of candidates) {
       const offer = await this.withInvocation(context, candidate.id, "executor:claim", async (tx, inv, _cred, open) => {
         if (!open || inv.status !== "READY" || !(await this.pinned(tx, inv)).eligible) return null;
         if (sessionId && !await currentSession(tx, context, sessionId, inv.authorization?.bindingId)) return null;
         return { invocationId: inv.id, runId: inv.runId, versionId: inv.versionId, toolId: inv.toolId, executionAllowed: false as const };
       });
+      examined++;
       if (offer) offers.push(offer);
       if (offers.length === limit) break;
+    }
+    // An overlapping poll cannot overwrite newer progress or revive an evicted scope.
+    if (this.pollProgress.get(scope) === progress) {
+      if (examined === candidates.length && candidates.length < POLL_PAGE_SIZE) this.pollProgress.delete(scope);
+      else this.pollProgress.set(scope, { through: progress.through, after: candidates[examined - 1]! });
     }
     return { offers, startAllowed: false as const };
   }

@@ -1,3 +1,6 @@
+import { createServer } from "node:http";
+import { ExecutorApi, HttpExecutorClient } from "../src/executor-runtime/api-client.js";
+import { executorProtocolOptions } from "../src/executor/protocol-validation.js";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -50,13 +53,13 @@ test("fault-injected reopen never reruns a possibly started handler and resends 
       const identity: LedgerIdentity = { deploymentId: "dep", bindingId: "bind", ledgerId: randomUUID(), artifactDigest: "a".repeat(64) };
       let calls = 0, session = 0, start: any = null; const reports = new Map<string, any>();
       const api = { async call(route: string, body?: any) {
-        if (route === "/sessions") return { session: { id: `session-${++session}`, active: true, ...identity } };
-        if (route === "/recovery") return { claims: ledger.all().map(a=>({id:a.claimId,invocationId:a.invocationId,generation:a.generation,sessionId:a.sessionId,artifactDigest:a.artifactDigest,status:"ACTIVE",reportCredentialCurrent:true,start:start?{id:start.id,requestKey:start.requestKey,reports:[...reports.entries()].map(([digest,b])=>({id:"report-"+digest,digest,outcome:b.outcome}))}:null})),hasMore:false,nextCursor:null };
-        if (route === "/poll") return { offers: [{ invocationId: "inv" }] };
-        if (route === "/claims") return { claim: { id: "claim", invocationId: "inv", generation: 1 } };
-        if (route.endsWith("/release")) return {};
-        if (route.endsWith("/authorize-start")) { start = { ...body, id: "start", invocationId: "inv", claimId: "claim", startDeadline: new Date(Date.now() + 5000).toISOString() }; return { start, startAllowed: true, ledgerId: identity.ledgerId }; }
-        if (route.endsWith("/start")) return { start, startCommitted: !!start, claimFenced: true };
+        if (route === "/sessions") return { session: { id: `session-${++session}`, generation: 1, executionProfile: "docker-health-ping-v1", active: true, ...identity } };
+        if (route === "/recovery") return { claims: ledger.all().map(a=>({id:a.claimId,invocationId:a.invocationId,generation:a.generation,sessionId:a.sessionId,artifactDigest:a.artifactDigest,status:"ACTIVE",reportCredentialCurrent:true,start:start?{id:start.id,requestKey:start.requestKey,reports:[...reports.entries()].map(([digest,b])=>({id:"report-"+digest,digest,outcome:b.outcome}))}:null})),executionAllowed:false,hasMore:false,nextCursor:null };
+        if (route === "/poll") return { startAllowed: false, offers: [{ executionAllowed: false, runId: "run", invocationId: "inv" }] };
+        if (route === "/claims") return { claim: { deploymentId: identity.deploymentId, runId:"run", status:"ACTIVE", startAllowed:false, executionAllowed:false, id: "claim", invocationId: "inv", generation: 1 } };
+        if (route.endsWith("/release")) return { claim: { deploymentId:identity.deploymentId,runId:"run",status:"RELEASED",startAllowed:false,executionAllowed:false,id:"claim",invocationId:"inv",generation:1 } };
+        if (route.endsWith("/authorize-start")) { start = { ...body, authorizationDigest: "a".repeat(64), id: "start", invocationId: "inv", claimId: "claim", startDeadline: new Date(Date.now() + 5000).toISOString() }; return { start, executionAllowed: true, startAllowed: true, ledgerId: identity.ledgerId }; }
+        if (route.endsWith("/start")) return { start, startAllowed:false,executionAllowed:false,startCommitted: !!start, claimFenced: true };
         if (route.endsWith("/results")) { const digest = reportIdentity(body).digest; if (!reports.has(digest)) reports.set(digest, body); return { acknowledged: true, reportId: "report-"+digest, outcome: body.outcome, startId: "start", digest, verification: "EXECUTOR_REPORTED" }; }
         throw new Error("Unexpected route");
       } };
@@ -90,20 +93,77 @@ test("trusted Docker launch rejects shared/privileged/exposed executor profiles"
 });
 
 
-test("malformed result ACK never clears a durable pending result",async()=>{
- for(const patch of [{reportId:undefined},{outcome:"UNKNOWN"},{verification:undefined},{digest:"bad"}]){
-  const dir=await mkdtemp(path.join(tmpdir(),"foundry-ack-")),file=path.join(dir,"ledger.sqlite"),identity={deploymentId:"dep",bindingId:"bind",ledgerId:randomUUID(),artifactDigest:"a".repeat(64)};
-  initializeLedger(file,identity);const ledger=new StartLedger(file,identity);let calls=0;
-  const api={async call(route:string,body?:any){
-   if(route==="/sessions")return{session:{...identity,id:"session",active:true}};
-   if(route==="/recovery")return{claims:[],hasMore:false};
-   if(route==="/poll")return{offers:[{invocationId:"inv"}]};
-   if(route==="/claims")return{claim:{id:"claim",invocationId:"inv",generation:1}};
-   if(route.endsWith("authorize-start"))return{startAllowed:true,ledgerId:identity.ledgerId,start:{...body,id:"start",invocationId:"inv",claimId:"claim",startDeadline:new Date(Date.now()+5000).toISOString()}};
-   if(route.endsWith("results"))return{acknowledged:true,reportId:"report",startId:"start",digest:reportIdentity(body).digest,outcome:body.outcome,verification:"EXECUTOR_REPORTED",...patch};
-   throw Error("Unexpected request");
-  }};
-  try{const runtime=new IsolatedExecutorRuntime(ledger,api,()=>{},()=>{},()=>{calls++;return HEALTH_RESULT;});await runtime.initialize();await assert.rejects(runtime.tick());assert.equal(calls,1);assert.equal(ledger.get("claim").state,"RESULT_PENDING");assert.equal(ledger.get("claim").ack,null);}
-  finally{ledger.close();await rm(dir,{recursive:true,force:true});}
- }
+test("invalid claim, permit or ACK stops the executor at its durable boundary", async t => {
+  type Stage = "claim" | "permit" | "start" | "ack";
+  const cases: Array<[Stage, Record<string, unknown>]> = [
+    ["claim", { deploymentId: "other" }], ["claim", { invocationId: "other" }], ["claim", { generation: -1 }],
+    ["permit", { startAllowed: "false" }], ["permit", { executionAllowed: false }], ["permit", { executionAllowed: undefined }],
+    ["permit", { ledgerId: "other" }], ["permit", { start: null }],
+    ["start", { sessionId: "other" }], ["start", { claimId: "other" }], ["start", { generation: 2 }],
+    ["start", { startDeadline: undefined }], ["start", { artifactDigest: "b".repeat(64) }],
+    ["ack", { acknowledged: "true" }], ["ack", { startId: "other" }], ["ack", { reportId: undefined }],
+    ["ack", { outcome: "UNKNOWN" }], ["ack", { verification: undefined }], ["ack", { digest: "bad" }],
+  ];
+  for (const [stage, patch] of cases) await t.test(stage + " " + Object.keys(patch)[0] + "=" + Object.values(patch)[0], async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "foundry-boundary-"));
+    const file = path.join(dir, "ledger.sqlite");
+    const identity = { deploymentId: "dep", bindingId: "bind", ledgerId: randomUUID(), artifactDigest: "a".repeat(64) };
+    initializeLedger(file, identity);
+    const ledger = new StartLedger(file, identity);
+    let calls = 0;
+    const api = { async call(route: string, body?: any) {
+      if (route === "/sessions") return { session: { ...identity, generation: 1, executionProfile: "docker-health-ping-v1", id: "session", active: true } };
+      if (route === "/recovery") return { executionAllowed: false, claims: [], hasMore: false, nextCursor: null };
+      if (route === "/poll") return { startAllowed: false, offers: [{ executionAllowed: false, runId: "run", invocationId: "inv" }] };
+      if (route === "/claims") return { claim: { deploymentId: "dep", runId: "run", status: "ACTIVE", startAllowed: false,
+        executionAllowed: false, id: "claim", invocationId: "inv", generation: 1, ...(stage === "claim" && patch) } };
+      if (route.endsWith("/authorize-start")) return { startAllowed: true, executionAllowed: true, ledgerId: identity.ledgerId,
+        start: { ...body, authorizationDigest: identity.artifactDigest, id: "start", invocationId: "inv", claimId: "claim",
+          startDeadline: new Date(Date.now() + 5000).toISOString(), ...(stage === "start" && patch) }, ...(stage === "permit" && patch) };
+      if (route.endsWith("/results")) return { acknowledged: true, reportId: "report", startId: "start", digest: reportIdentity(body).digest,
+        outcome: body.outcome, verification: "EXECUTOR_REPORTED", ...patch };
+      throw Error("Unexpected request");
+    } };
+    try {
+      const runtime = new IsolatedExecutorRuntime(ledger, api, () => {}, () => {}, () => { calls++; return HEALTH_RESULT; });
+      await runtime.initialize();
+      await assert.rejects(runtime.tick());
+      assert.equal(calls, stage === "ack" ? 1 : 0);
+      if (stage === "claim") assert.deepEqual(ledger.all(), []);
+      else {
+        const a = ledger.get("claim");
+        assert.equal(a.state, stage === "ack" ? "RESULT_PENDING" : "START_REQUESTED");
+        assert.equal(a.ack, null);
+        if (stage === "ack") assert.equal(JSON.parse(a.report!).outcome, "SUCCEEDED");
+      }
+    } finally { ledger.close(); await rm(dir, { recursive: true, force: true }); }
+  });
+});
+
+test("shared API lease configuration accepts only in-range integer milliseconds", () => {
+  assert.deepEqual(executorProtocolOptions({}), { leaseMs: 30000 });
+  for (const value of ["1000", "7100", "120000"])
+    assert.deepEqual(executorProtocolOptions({ FOUNDRY_EXECUTOR_LEASE_MS: value }), { leaseMs: Number(value) });
+  for (const value of ["", " ", "999", "120001", "-1000", "1.5", "2e3", "5000ms"])
+    assert.throws(() => executorProtocolOptions({ FOUNDRY_EXECUTOR_LEASE_MS: value }), /FOUNDRY_EXECUTOR_LEASE_MS/);
+});
+
+test("executor rejects invalid JSON and malformed success envelopes over HTTP", async () => {
+  let reply = "{";
+  const server = createServer((_req, res) => res.writeHead(200, { "content-type": "application/json" }).end(reply));
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const api = new ExecutorApi(new HttpExecutorClient(`http://127.0.0.1:${address.port}`, "test-only"));
+    await assert.rejects(api.poll("session"), SyntaxError);
+    for (const value of [null, [], { startAllowed: false, offers: "invalid" }]) {
+      reply = JSON.stringify(value);
+      await assert.rejects(api.poll("session"), /Invalid executor API response/);
+    }
+    reply = JSON.stringify({ startAllowed: false, executionAllowed: false, startCommitted: false, start: {}, claimFenced: true });
+    await assert.rejects(api.inspect("claim"), /Invalid executor API response/);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
 });

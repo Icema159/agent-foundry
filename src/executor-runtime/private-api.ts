@@ -8,11 +8,13 @@ import { ExecutorExecution } from "../executor/execution-service.js";
 import { createExternalApiServer } from "../external-api/server.js";
 import { assertLinuxIsolation } from "./isolation.js";
 
+import { executorProtocolOptions } from "../executor/protocol-validation.js";
+
 async function main() {
   assertLinuxIsolation();
   if (process.env.FOUNDRY_PRIVATE_API !== "1") throw new Error("Private container API requires explicit configuration");
   const db = createPrismaClient(readFileSync("/api-secrets/database-url", "utf8").trim());
-  const protocol = new ExecutorProtocol(db);
+  const protocol = new ExecutorProtocol(db, executorProtocolOptions(process.env));
   const server = createExternalApiServer({ auth: new CredentialAuthenticator(new PrismaIdentityStore(db)), invocations: new InvocationService(db), executors: protocol, execution: new ExecutorExecution(db, protocol, true) });
   let stopping = false;
   async function stop() {

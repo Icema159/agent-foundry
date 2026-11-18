@@ -1,3 +1,4 @@
+import { deliverTaskRun } from "./task-delivery.js";
 import type { AgentDefinition, ExecutionStore } from "../persistence/execution-store.js";
 import type { TaskRunQueue } from "./agent-task-queue.js";
 import { parsePostconditions, type TaskPostcondition } from "../verification/task-postconditions.js";
@@ -21,6 +22,6 @@ export async function submitTask(options: {
     postconditions,
   );
   await options.onCreated?.(pending);
-  const job = await options.queue.enqueue(pending.taskRunId);
-  return { ...pending, jobId: job.jobId };
+  const job = await deliverTaskRun(options.store, options.queue, pending, "SUBMISSION");
+  return { taskId: pending.taskId, taskRunId: pending.taskRunId, jobId: job.jobId };
 }
